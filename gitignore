@@ -1,0 +1,27 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Secrets and local config (Wi-Fi credentials, keys)
+.env
+secrets.h
+config.local.py
+
+# Local data
+*.db
+*.sqlite3
+snapshots/
+logs/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Arduino build output
+build/
+*.elf
+*.bin
