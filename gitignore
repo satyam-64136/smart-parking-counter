@@ -25,3 +25,8 @@ Thumbs.db
 build/
 *.elf
 *.bin
+
+# Per-session vision output
+baseline.png
+dashboard_*.png
+selftest_dashboard.png

@@ -1,0 +1,50 @@
+{
+  "project": "Digital Smart Parking Counter",
+  "status": "Prototyping: vision pipeline simulated and tested in software; purchases and hardware tests not confirmed",
+  "goal": "Ten-slot miniature parking system (hand-drawn A4 sheet, two one-way lanes) using computer vision exclusively for vehicle detection",
+  "hardware": {
+    "controller": "NodeMCU ESP-12E (ESP8266) development board; 3.3V logic, USB powered",
+    "camera": "Phone camera streamed to the laptop (Android IP Webcam URL, or DroidCam / Iriun / Camo as a virtual webcam); replaces the proposed Zebronics webcam",
+    "servo": "MG90S 180-degree positional servo, one entrance barrier, signal on D5 (GPIO14)",
+    "servo_power": "AA battery pack (4 NiMH, or 4 alkaline through a 1N4001 diode, or 3 AA); servo rated about 4.8-6V; common ground with NodeMCU; 470-1000 uF capacitor across servo supply",
+    "model": "A4 white sheet sketch: central divider, left lane up, right lane down, 5 angled slots on each side (10 total), toy cars; place on a dark non-white surface with the whole sheet in view",
+    "later_additions": [
+      "16x2 I2C LCD on D1/D2 (SCL/SDA), 3.3V-safe",
+      "red and green LEDs with resistors on D6 and D7"
+    ],
+    "vehicle_detection_sensors": "None: no IR, LDR, ultrasonic, or RFID for detecting vehicles"
+  },
+  "architecture": [
+    "Phone camera streams frames to laptop (any angle)",
+    "Python OpenCV finds the sheet, warps it to a top-down view, compares each slot with an empty-sheet baseline",
+    "Laptop dashboard shows camera view, top-down view, change mask, per-slot ratios and the logic equations",
+    "Laptop sends commands and occupancy over Wi-Fi to the ESP8266",
+    "ESP8266 drives the MG90S servo and later LCD/LEDs",
+    "Flask website shows live status; SQLite records slot occupancy sessions and gate events"
+  ],
+  "digital_logic": {
+    "occupancy": "S1..S10 (L1-L5 left, R1-R5 right) are binary (1 occupied, 0 empty)",
+    "occupied_count": "sum of S1..S10 (arithmetic sum)",
+    "available_count": "10 - occupied_count",
+    "full": "AND of all ten slots",
+    "open_permission": "vehicle_at_entrance AND NOT full",
+    "implementation": "Initially firmware/software logic; physical gate ICs optional"
+  },
+  "development_steps": [
+    "Test MG90S with NodeMCU using battery supply and common ground",
+    "Run vision/parking_vision.py with the phone stream and check sheet tracking",
+    "Capture the empty-sheet baseline and tune slot polygons (E key) and thresholds",
+    "Confirm debounced occupancy on toy cars from several camera angles",
+    "Implement Wi-Fi messaging and safe gate state machine",
+    "Build Flask dashboard and SQLite event logging",
+    "Integrate LCD and LEDs and run full demonstration"
+  ],
+  "safety_and_limits": [
+    "Do not power servo from NodeMCU 3V3 or GPIO",
+    "Never connect AA battery positive to NodeMCU 3V3 or VIN",
+    "Ensure the barrier is clear before closing; vision can fail due to occlusion and lighting",
+    "Background difference detects visual changes, not vehicle identity",
+    "Avoid claiming actual car entry times when only slot occupancy sessions are observed",
+    "Parallax: tall toy cars shift in the top-down view; mount the phone high and keep slot polygons snug"
+  ]
+}

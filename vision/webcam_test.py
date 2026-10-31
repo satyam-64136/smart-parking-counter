@@ -6,8 +6,9 @@ Setup (PowerShell):
     pip install opencv-python numpy
 
 Run:
-    python webcam_test.py            # camera index 0
-    python webcam_test.py 1          # try index 1 if 0 is your laptop camera
+    python webcam_test.py                              # camera index 0
+    python webcam_test.py 1                            # try index 1 if 0 is your laptop camera
+    python webcam_test.py http://PHONE_IP:8080/video   # Android "IP Webcam" phone stream
 
 Keys: q = quit, s = save snapshot (snapshots/empty_scene_N.jpg)
 Use saved snapshots later as the empty-scene reference for calibration.
@@ -18,17 +19,18 @@ import time
 
 import cv2
 
-CAM_INDEX = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+SOURCE = sys.argv[1] if len(sys.argv) > 1 else "0"
+CAM_INDEX = int(SOURCE) if SOURCE.isdigit() else SOURCE
 WIDTH, HEIGHT = 1280, 720   # 720p is plenty for a 40x40 cm model and much faster than 1080p
 
 # CAP_DSHOW opens faster and is more reliable on Windows
-cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW) if isinstance(CAM_INDEX, int) and os.name == "nt" else cv2.VideoCapture(CAM_INDEX)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 if not cap.isOpened():
-    sys.exit(f"Could not open camera index {CAM_INDEX}. Try another index (0, 1, 2).")
+    sys.exit(f"Could not open {CAM_INDEX}. Try another index (0, 1, 2) or check the phone URL and Wi-Fi.")
 
 actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
