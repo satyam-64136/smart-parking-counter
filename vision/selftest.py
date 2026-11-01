@@ -8,6 +8,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import parking_vision as pv
 
 W, H = pv.SHEET_W, pv.SHEET_H
+
+def floral_bg(seed=11):
+    """Pale patterned bedsheet, deliberately hard: pale-sage base, large near-white petals (as bright as
+    the paper), pink flowers, dark leaves. This is what used to be mistaken for the sheet."""
+    r = np.random.default_rng(seed)
+    bg = np.full((720, 1280, 3), (150, 168, 150), np.uint8)
+    for _ in range(140):
+        c = (int(r.integers(0, 1280)), int(r.integers(0, 720))); rad = int(r.integers(25, 80))
+        col = [(215, 222, 214), (205, 215, 225), (170, 160, 215), (120, 150, 120)][int(r.integers(0, 4))]
+        cv2.circle(bg, c, rad, col, -1)
+        for a in range(0, 360, 45):
+            p = (int(c[0] + 1.2 * rad * np.cos(np.radians(a))), int(c[1] + 1.2 * rad * np.sin(np.radians(a))))
+            cv2.circle(bg, p, rad // 2, col, -1)
+        cv2.circle(bg, c, rad // 4, (90, 150, 190), -1)
+    for _ in range(300):
+        p = r.integers(0, [1280, 720]); q = p + r.integers(-60, 60, 2)
+        cv2.line(bg, tuple(int(v) for v in p), tuple(int(v) for v in q), (60, 100, 60), int(r.integers(2, 6)))
+    bg = np.clip(bg.astype(np.int16) + r.integers(-12, 12, bg.shape), 0, 255).astype(np.uint8)
+    return cv2.GaussianBlur(bg, (0, 0), 1.5)
 ZONES = dict(pv.DEFAULT_ZONES)
 
 def make_sheet():
@@ -33,7 +52,7 @@ def put_car(img, name, kind):
         cv2.fillPoly(img, [box], (238,238,238)); cv2.polylines(img, [box], True, (150,150,150), 2)
         cv2.rectangle(img, tuple(box.min(0)+[10,10]), tuple(box.max(0)-[10,10]), (190,190,190), 2)
 
-def render(sheet_img, tilt, roll, dist, yaw=0, bright=1.0, seed=0, f=900):
+def render(sheet_img, tilt, roll, dist, yaw=0, bright=1.0, seed=0, f=900, floral=False, grad=0.0):
     """pinhole camera looking at the A4 sheet (21 x 29.7 cm) lying on z=0"""
     r = np.random.default_rng(seed)
     obj = np.float32([[-10.5, -14.85, 0], [10.5, -14.85, 0], [10.5, 14.85, 0], [-10.5, 14.85, 0]])
@@ -45,13 +64,19 @@ def render(sheet_img, tilt, roll, dist, yaw=0, bright=1.0, seed=0, f=900):
     K = np.array([[f, 0, 640], [0, f, 360], [0, 0, 1]], np.float64)
     pts, _ = cv2.projectPoints(obj, rvec, np.array([0, 0, dist], np.float64), K, None)
     pts = pts.reshape(4, 2).astype(np.float32)
-    bg = np.full((720, 1280, 3), (70, 110, 70), np.uint8)
-    bg = np.clip(bg.astype(np.int16) + r.integers(-25, 25, bg.shape), 0, 255).astype(np.uint8)
-    bg = cv2.GaussianBlur(bg, (0, 0), 2)
+    if floral:
+        bg = floral_bg(11)                      # fixed bedsheet pattern (the sheet is static, only the camera moves)
+    else:
+        bg = np.full((720, 1280, 3), (70, 110, 70), np.uint8)
+        bg = np.clip(bg.astype(np.int16) + r.integers(-25, 25, bg.shape), 0, 255).astype(np.uint8)
+        bg = cv2.GaussianBlur(bg, (0, 0), 2)
     Hm = cv2.getPerspectiveTransform(pv.DST, pts)
     warped = cv2.warpPerspective(sheet_img, Hm, (1280, 720), flags=cv2.INTER_AREA)
     m = cv2.warpPerspective(np.full((H, W), 255, np.uint8), Hm, (1280, 720)) > 0
     img = bg.copy(); img[m] = warped[m]
+    if grad:                                    # lighting gradient across the scene
+        ramp = 1.0 + grad * (np.linspace(-1, 1, 1280)[None, :, None])
+        img = img.astype(np.float32) * ramp
     img = np.clip(img.astype(np.float32) * bright, 0, 255).astype(np.uint8)
     img = np.clip(img.astype(np.int16) + r.integers(-4, 4, img.shape), 0, 255).astype(np.uint8)
     return img, pts
@@ -156,3 +181,100 @@ s3 = sheet.copy(); poly = np.float32(ZONES['L3']) * [W, H]; c = poly.mean(0)
 box = cv2.boxPoints(((c[0], c[1]), (90, 40), 25)).astype(np.int32); cv2.fillPoly(s3, [box], (150,150,150))
 for i in range(6): r = v.process(render(s3, seed=9+i, **POSES["tilt 35deg"])[0])
 print("light-gray car (150) in L3 ->", round(float(r['ratios']['L3']),2), r['occ']['L3'])
+
+
+# =====================================================================================
+print("---- FLORAL BEDSHEET: sheet must be found automatically, not the cloth (all poses, lighting gradient) ----")
+def paper_ok(v, pts, tol=0.04):
+    if v.corners is None: return False, 9.9
+    diag = np.linalg.norm(pts[0] - pts[2])
+    a = order_pts(pts); b = order_pts(v.corners)
+    e = min(np.linalg.norm(np.roll(b, k, axis=0) - a, axis=1).mean() for k in range(4)) / diag
+    return e < tol, e
+def order_pts(p): return pv.order_cyclic(p)
+for name, pose in POSES.items():
+    v = pv.ParkingVision(pv.DEFAULT_ZONES, frames=3)
+    e, pts = render(sheet, seed=0, floral=True, grad=0.10, **pose)
+    o = v.process(e)
+    ok, err = paper_ok(v, pts)
+    rect = o['rect']
+    print(f"{name:22s} paper conf={v.paper_conf:.2f} corner err={err*100:4.1f}% of diag  state={v.paper_state:9s} {'PASS' if ok else 'FAIL'}")
+    if rect is not None and name == "tilt 55deg": cv2.imwrite('selftest_floral_rect.png', rect)
+
+print("---- FLORAL: full occupancy run on every pose ----")
+for name, pose in POSES.items():
+    v = pv.ParkingVision(pv.DEFAULT_ZONES, frames=3)
+    e, _ = render(sheet, seed=0, floral=True, grad=0.10, **pose); o = fix_flip(v, e); v.set_baseline(o['rect'])
+    s2 = sheet.copy()
+    for n, k in CARS.items(): put_car(s2, n, k)
+    for i in range(8): res = v.process(render(s2, seed=3 + i, floral=True, grad=0.10, bright=0.9, **pose)[0])
+    occ = sorted(n for n in v.slot_names if res['status'][n] == 'OCCUPIED')
+    emp = sorted(n for n in v.slot_names if res['status'][n] == 'EMPTY')
+    unc = sorted(n for n in v.slot_names if res['status'][n] == 'UNCERTAIN')
+    ok = occ == truth and len(emp) == 10 - len(truth) and not unc
+    print(f"{name:22s} occ={occ} uncertain={unc}  {'PASS' if ok else 'FAIL'}")
+    if name == "tilt 55deg": cv2.imwrite('selftest_floral_dashboard.png', pv.build_dashboard(v, res, 24.0, 'phone (simulated)'))
+
+print("---- DECOY: big bright square card next to the sheet must not be chosen ----")
+v = pv.ParkingVision(pv.DEFAULT_ZONES, frames=3)
+e2, pts = render(sheet, seed=0, floral=True, **POSES["overhead"]); cv2.rectangle(e2, (820, 100), (1250, 540), (238, 240, 238), -1)
+v.process(e2); ok, err = paper_ok(v, pts)
+print("sheet chosen over square white card:", ok, f"(err {err*100:.1f}%)", "PASS" if ok else "FAIL")
+
+print("---- NO PAPER (only bedsheet in view): must warn, never report occupancy ----")
+v = pv.ParkingVision(pv.DEFAULT_ZONES, frames=3)
+bg = floral_bg(11)
+for i in range(6): res = v.process(np.clip(bg.astype(np.int16) + np.random.default_rng(i).integers(-3, 3, bg.shape), 0, 255).astype(np.uint8))
+print("paper_state:", res['paper_state'], "| valid:", res['valid'], "| statuses:", set(res['status'].values()), "|", res['reason'],
+      "PASS" if (res['paper_state'] == 'SEARCHING' and not res['valid']) else "FAIL")
+
+print("---- CAMERA MOVED / OLD BASELINE: baseline must be invalidated, not silently reused ----")
+v = pv.ParkingVision(pv.DEFAULT_ZONES, frames=3)
+e, _ = render(sheet, seed=0, floral=True, **POSES["overhead"]); o = fix_flip(v, e)
+other = np.full((H, W, 3), 245, np.uint8); [cv2.line(other, (40 + 90 * i, 20), (500 - 60 * i, 770), (50, 50, 50), 4) for i in range(6)]; cv2.circle(other, (280, 400), 120, (0, 0, 0), 8)
+v.set_baseline(pv.cv2.resize(other, (W, H)), trusted=False)       # a baseline from a different sheet / old session
+for i in range(12): res = v.process(render(sheet, seed=i, floral=True, **POSES["overhead"])[0])
+print("stale baseline -> baseline_ok:", res['baseline_ok'], "align:", None if res['align'] is None else round(res['align'], 2), "| valid:", res['valid'], "|", res['reason'],
+      "PASS" if (not res['baseline_ok'] and not res['valid']) else "FAIL")
+v.set_baseline(o['rect'])
+for i in range(8): res = v.process(render(sheet, seed=i, floral=True, **POSES["overhead"])[0])
+for i in range(3): res = v.process(render(sheet, seed=i, floral=True, **POSES["tilt 35deg"])[0])
+print("camera moved ->", "moved flag:", res['moved'], "| valid:", res['valid'], "|", res['reason'])
+for i in range(25): res = v.process(render(sheet, seed=i, floral=True, **POSES["tilt 35deg"])[0])
+print("after re-settling -> baseline_ok:", res['baseline_ok'], "valid:", res['valid'], "statuses:", sorted(set(res['status'].values())),
+      "PASS" if (res['baseline_ok'] and res['valid']) else "FAIL")
+
+print("---- UNCERTAIN handling + logic ----")
+d = pv.Debounced(0.12, 0.05, frames=3)
+seq = [0.0] * 5 + [0.08] * 12            # settles empty, then lingers in the grey zone
+st = []
+for r_ in seq: d.update(r_); st.append(d.status)
+print("grey-zone ratio 0.08 -> status path:", st[4], "->", st[-1], "PASS" if (st[4] == 'EMPTY' and st[-1] == 'UNCERTAIN') else "FAIL")
+d2 = pv.Debounced(0.12, 0.05, frames=3)
+for r_ in [0.3] * 6: d2.update(r_)
+for r_ in [0.0] * 2: d2.update(r_)
+print("2 empty frames after occupied (debounce) ->", d2.status, "PASS" if d2.status == 'OCCUPIED' else "FAIL")
+for _ in range(40): d2.update(None, reliable=False)
+print("preserved through unreliable frames ->", d2.status)
+v = pv.ParkingVision(pv.DEFAULT_ZONES, frames=3)
+stt = {n: 'OCCUPIED' for n in v.slot_names}; stt['ENTRY'] = 'OCCUPIED'
+lg = v.logic({}, dict(stt), True); print("all occupied: full", lg['full'], "gate", lg['gate_open'], "PASS" if (lg['full'] and not lg['gate_open']) else "FAIL")
+stt['L1'] = 'UNCERTAIN'; lg = v.logic({}, dict(stt), True)
+print("one uncertain, rest occupied: occupied", lg['occupied'], "uncertain", lg['uncertain'], "full", lg['full'], "gate", lg['gate_open'], "PASS" if (lg['occupied'] == 9 and not lg['full'] and not lg['gate_open']) else "FAIL")
+
+print("---- PARALLAX: tall car in L2 leans over into L3 (overhang must not make L3 occupied) ----")
+v = pv.ParkingVision(pv.DEFAULT_ZONES, frames=3)
+e, _ = render(sheet, seed=0, **POSES["tilt 35deg"]); o = fix_flip(v, e); v.set_baseline(o['rect'])
+s4 = sheet.copy(); put_car(s4, 'L2', 'red')
+zc = np.float32(ZONES['L2']) * [W, H]; z3 = np.float32(ZONES['L3']) * [W, H]
+y_line = int((zc[2][1] + zc[3][1]) / 2)
+cv2.rectangle(s4, (int(zc.mean(0)[0]) - 40, y_line - 14), (int(zc.mean(0)[0]) + 40, y_line + 14), (30, 30, 200), -1)   # overhang into L3
+for i in range(8): r = v.process(render(s4, seed=9 + i, **POSES["tilt 35deg"])[0])
+print("L2:", r['status']['L2'], f"{r['ratios']['L2']:.2f}", "| L3:", r['status']['L3'], f"{r['ratios']['L3']:.2f}",
+      "PASS" if (r['status']['L2'] == 'OCCUPIED' and r['status']['L3'] == 'EMPTY') else "FAIL")
+print("---- SHEET CUT OFF BY FRAME: must be rejected, not warped ----")
+v = pv.ParkingVision(pv.DEFAULT_ZONES, frames=3)
+e, _ = render(sheet, seed=0, tilt=40, roll=0, dist=26)                  # camera too close: sheet runs out of frame
+res = v.process(e)
+print("paper_state:", res['paper_state'], "|", None if v.paper_dbg is None or v.paper_dbg['best_rejected'] is None else v.paper_dbg['best_rejected'][2],
+      "PASS" if res['paper_state'] == 'SEARCHING' else "FAIL")
