@@ -284,10 +284,17 @@ class LiveEngine:
         new_edges = (edges > 0) & (self.ref_edges == 0)
         new_edges = cv2.dilate(new_edges.astype(np.uint8) * 255, np.ones((3, 3), np.uint8))
         new_edges = cv2.morphologyEx(new_edges, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
-        cnts, _ = cv2.findContours(new_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in cnts:
-            hull = cv2.convexHull(c)
-            if cv2.contourArea(hull) > 100 and min(cv2.minAreaRect(hull)[1]) >= 9:
+        # fill the outline of a flat, light car - but only compact, car-sized, outline-like shapes
+        # (scattered edge noise joined into one big shape must never be filled)
+        n_cc, lab_cc, st_cc, _ = cv2.connectedComponentsWithStats((new_edges > 0).astype(np.uint8), connectivity=8)
+        for i in range(1, n_cc):
+            x, y, w, h, area_px = st_cc[i]
+            if area_px < 40 or w * h > 2.5 * self.med_area:
+                continue
+            pts = cv2.findNonZero((lab_cc[y:y + h, x:x + w] == i).astype(np.uint8))
+            hull = cv2.convexHull(pts) + np.array([[[x, y]]], np.int32)
+            ha = cv2.contourArea(hull)
+            if 100 < ha <= 1.5 * self.med_area and area_px / ha >= 0.12 and min(cv2.minAreaRect(hull)[1]) >= 9:
                 cv2.drawContours(new_edges, [hull], -1, 255, cv2.FILLED)
         mask = changed.astype(np.uint8) * 255 | new_edges
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
@@ -345,8 +352,8 @@ class LiveEngine:
             return 0.1                                          # P clearly visible
         if ncc <= P_LO:                                         # P hidden
             return 0.45 + 0.55 * float(np.clip(ratio / CAR_MIN_CHANGE, 0, 1)) if ratio < CAR_MIN_CHANGE else 1.0
-        part = (P_HI - ncc) / (P_HI - P_LO)                     # P partly covered / uncertain: needs a clear change
-        return 0.8 * float(np.clip((ratio - 0.10) / 0.20, 0, 1)) * (0.5 + 0.5 * part)
+        # P partly covered (0.60..0.80): a car if a real chunk of the slot also changed; a lone blur or shade is not enough
+        return 0.75 * float(np.clip((ratio - 0.08) / 0.14, 0, 1))
 
     # -- one frame ---------------------------------------------------------------------
     def process(self, frame, now=None):
