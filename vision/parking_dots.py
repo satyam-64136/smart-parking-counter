@@ -168,6 +168,24 @@ def build_template(photo_path, json_path, png_path):
                 o += d / (np.linalg.norm(d) + 1e-6) * inset
             poly = [o0, inn[i], inn[i + 1], o1] if side == "L" else [inn[i], o0, o1, inn[i + 1]]
             zones.append({"name": f"{side}{i + 1}", "poly": [[float(x), float(y)] for x, y in poly]})
+    # locate the painted "P" in every slot: the biggest dark ink blob in the middle of the slot
+    gray = cv2.cvtColor(canon, cv2.COLOR_BGR2GRAY)
+    for z in zones:
+        poly = np.int32(z["poly"])
+        m = np.zeros(gray.shape, np.uint8)
+        cv2.fillPoly(m, [poly], 255)
+        inner = cv2.erode(m, np.ones((31, 31), np.uint8)) > 0
+        paper_lvl = float(np.percentile(gray[inner], 80)) if inner.any() else 200.0
+        ink = ((gray < 0.62 * paper_lvl) & inner).astype(np.uint8) * 255
+        ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        cnts, _ = cv2.findContours(ink, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            a = cv2.contourArea(c)
+            if 120 <= a and 10 <= w <= 0.5 * CAN_W * 0.4 and 10 <= h <= 0.4 * CH and (best is None or a > best[0]):
+                best = (a, [int(x), int(y), int(w), int(h)])
+        z["p_box"] = None if best is None else best[1]
     anchors = np.vstack([rows["L"], rows["R"]]) * s
     allpts = np.vstack([relaxed[:, :2] * s])
     paper = cv2.convexHull(allpts.astype(np.float32)).reshape(-1, 2)
@@ -341,7 +359,9 @@ class SheetTracker:
             if res is None:
                 continue
             H, inl, rms, matched = res
-            if inl >= MIN_INLIERS_INIT and rms <= 0.0013 * L and self._sane(H, shape, can):
+            tight = inl >= MIN_INLIERS_INIT and rms <= 0.0013 * L                  # few dots: must fit very exactly
+            loose = inl >= 10 and rms <= 0.004 * L                                 # many dots: uneven paper may fit less exactly
+            if (tight or loose) and self._sane(H, shape, can):
                 key = (inl, -rms)
                 if best is None or key > best[0]:
                     best = (key, res)
