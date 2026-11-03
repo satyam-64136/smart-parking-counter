@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 
 import cv2
@@ -38,9 +39,11 @@ CAR_MIN_CHANGE = 0.07            # a hidden P only means 'car' if the slot ALSO 
 ALIGN_MIN_LIVE = 0.30            # looser than parking_dots: uneven / curled paper is allowed
 EMA_ALPHA = 0.4                  # temporal noise reduction: weight of the newest aligned frame
 SCORE_MEDIAN = 5                 # median of the last 5 scores per slot
-WARMUP_FRAMES = 8                # trusted frames before the first answer
+WARMUP_FRAMES = 5                # trusted frames before the first answer
+VERIFY_FRAMES, VERIFY_NEED, ALIGN_VERIFY = 4, 3, 0.65   # a NEW lock must match the sheet's lines before anything is decided
 EXPO_JUMP = 0.30                 # a sudden sheet brightness jump (light switched) pauses decisions for 2 frames
-TRUST_MIN_DOTS = 8               # fewer matched dots = shaky alignment: keep tracking but do not decide
+TRUST_MIN_DOTS = 6               # matched dots needed to decide (or enough tracked sheet features, see FLOW_MIN_TRUST)
+FLOW_MIN_TRUST = 40              # tracked sheet features that also count as a solid pose
 MASS_FLIP = 0.4                  # share of EMPTY slots flagged in the same frame = lighting event, not cars
 BLUR_RATIO = 0.45                # frame sharper than this x its usual sharpness is trusted
 DARK = (30, 30, 30)
@@ -100,15 +103,20 @@ class FastTracker(SheetTracker):
                 best, bd = (px, py), d
         return best
 
-    def _track_roi(self, frame, L, can):
+    def _dot_pairs(self, frame, L, R):
         proj = cv2.perspectiveTransform(self.anchor.reshape(-1, 1, 2), self.H).reshape(-1, 2)
-        R = float(np.clip(0.03 * L + 3.0 * self.speed, 0.03 * L, 0.12 * L))
         idx, pts = [], []
         for i, (px, py) in enumerate(proj):
             p = self._blob(frame, px, py, R, L)
             if p is not None:
                 idx.append(i)
                 pts.append(p)
+        return idx, pts
+
+    def _track_roi(self, frame, L, can):
+        proj = cv2.perspectiveTransform(self.anchor.reshape(-1, 1, 2), self.H).reshape(-1, 2)
+        R = float(np.clip(0.03 * L + 3.0 * self.speed, 0.03 * L, 0.12 * L))
+        idx, pts = self._dot_pairs(frame, L, R)
         if len(idx) < MIN_INLIERS_TRACK:
             return None
         A, B = self.anchor[idx], np.float32(pts)
@@ -146,6 +154,128 @@ class FastTracker(SheetTracker):
                 self.t_track = (time.time() - t0) * 1000
                 return True
         ok = self.update(detect_dots(frame), frame.shape, can)           # slower full search: lost / fast move
+        self.t_track = (time.time() - t0) * 1000
+        return ok
+
+
+# ----------------------------------------------------------------------------
+# Smooth, drift-free pose: sheet features tracked with optical flow + the dots + a speed-adaptive filter
+# ----------------------------------------------------------------------------
+class OneEuro:
+    """1-euro filter: very smooth when the camera is still, almost no lag when it moves."""
+
+    def __init__(self, min_cutoff=1.0, beta=0.04, d_cutoff=1.0):
+        self.mc, self.beta, self.dc = min_cutoff, beta, d_cutoff
+        self.reset()
+
+    def reset(self):
+        self.x = self.dx = self.t = None
+
+    @staticmethod
+    def _alpha(dt, cutoff):
+        return 1.0 / (1.0 + (1.0 / (2.0 * np.pi * cutoff)) / dt)
+
+    def __call__(self, x, t):
+        x = np.asarray(x, np.float64)
+        if self.x is None:
+            self.x, self.dx, self.t = x.copy(), np.zeros_like(x), t
+            return x.copy()
+        dt = max(t - self.t, 1e-3)
+        ad = self._alpha(dt, self.dc)
+        self.dx = ad * (x - self.x) / dt + (1 - ad) * self.dx
+        speed = float(np.linalg.norm(self.dx) / np.sqrt(len(x) / 2.0))        # px per second, per point
+        a = self._alpha(dt, self.mc + self.beta * speed)
+        self.x = a * x + (1 - a) * self.x
+        self.t = t
+        return self.x.copy()
+
+
+class PoseTracker(FastTracker):
+    def __init__(self, anchors, feat_pts, canon):
+        super().__init__(anchors)
+        self.feat = np.float32(feat_pts).reshape(-1, 2)          # sheet features (template coordinates)
+        self.canon = canon
+        self.crect = np.float32([[0, 0], [canon[0], 0], [canon[0], canon[1]], [0, canon[1]]])
+        self.H_raw, self.prev_gray = None, None
+        self.filt = OneEuro()
+        self.flow_inl, self.new_lock = 0, False
+
+    def reset_pose(self):
+        self.H = self.H_raw = self.prev_gray = None
+        self.lost, self.mode, self.inliers, self.flow_inl = 0, "SEARCHING", 0, 0
+        self.matched[:] = False
+        self.filt.reset()
+
+    def _flow_pose(self, gray, frame, L, can):
+        h, w = gray.shape
+        P0 = cv2.perspectiveTransform(self.feat.reshape(-1, 1, 2), self.H_raw).reshape(-1, 2)
+        idx = np.where((P0[:, 0] > 12) & (P0[:, 0] < w - 12) & (P0[:, 1] > 12) & (P0[:, 1] < h - 12))[0]
+        if len(idx) < 30 or self.prev_gray is None:
+            return None
+        p0 = P0[idx].astype(np.float32).reshape(-1, 1, 2)
+        lk = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
+        p1, st, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, p0, None, **lk)
+        p0b, st2, _ = cv2.calcOpticalFlowPyrLK(gray, self.prev_gray, p1, None, **lk)
+        fb = np.linalg.norm((p0b - p0).reshape(-1, 2), axis=1)
+        good = (st.ravel() == 1) & (st2.ravel() == 1) & (fb < 1.2)
+        if good.sum() < 25:
+            return None
+        F, Pc = self.feat[idx][good], p1.reshape(-1, 2)[good]
+        Hn, inl = cv2.findHomography(F, Pc, cv2.RANSAC, max(2.0, 0.0025 * L))
+        if Hn is None or inl is None or int(inl.sum()) < 25 or inl.sum() < 0.5 * len(F):
+            return None
+        inl = inl.ravel().astype(bool)
+        F, Pc = F[inl], Pc[inl]
+        old_proj = cv2.perspectiveTransform(self.anchor.reshape(-1, 1, 2), self.H_raw).reshape(-1, 2)
+        self.H = Hn
+        R = float(np.clip(0.012 * L + 2.0 * self.speed, 0.012 * L, 0.05 * L))
+        didx, dpts = self._dot_pairs(frame, L, R)
+        matched, ninl, rms = np.zeros(len(self.anchor), bool), 0, None
+        if len(didx) >= 4:
+            A, B = self.anchor[didx], np.float32(dpts)
+            proj = cv2.perspectiveTransform(A.reshape(-1, 1, 2), Hn).reshape(-1, 2)
+            d = np.linalg.norm(proj - B, axis=1)
+            okd = d < max(4.0, 0.006 * L)
+            if okd.sum() >= 4:
+                Aok, Bok = A[okd], B[okd]
+                Hn2, _ = cv2.findHomography(np.vstack([F, np.repeat(Aok, 6, axis=0)]), np.vstack([Pc, np.repeat(Bok, 6, axis=0)]), 0)
+                if Hn2 is not None and self._sane(Hn2, frame.shape, can):
+                    Hn = Hn2
+                matched[np.array(didx)[okd]] = True
+                ninl, rms = int(okd.sum()), float(np.sqrt(np.mean(d[okd] ** 2)))
+        if not self._sane(Hn, frame.shape, can):
+            return None
+        new_proj = cv2.perspectiveTransform(self.anchor.reshape(-1, 1, 2), Hn).reshape(-1, 2)
+        self.speed = 0.5 * self.speed + 0.5 * float(np.mean(np.linalg.norm(new_proj - old_proj, axis=1)))
+        return Hn, ninl, rms, matched, int(len(F))
+
+    def update_frame(self, frame, can, now):
+        t0 = time.time()
+        L = float(max(frame.shape[:2]))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if self.gain_age >= 20:
+            self.gains, self.gain_age = self._wb(frame), 0
+        self.gain_age += 1
+        self.new_lock = False
+        ok = False
+        if self.H_raw is not None and self.lost <= 10:
+            res = self._flow_pose(gray, frame, L, can)
+            if res is not None:
+                self.H_raw, self.inliers, self.rms, self.matched, self.flow_inl = res
+                self.lost, self.mode, ok = 0, "TRACKING", True
+        if not ok:                                              # flow lost: dots in small windows, then full search
+            self.H = self.H_raw
+            ok = FastTracker.update_frame(self, frame, can)
+            if ok:
+                self.H_raw, self.flow_inl = self.H, 0
+                self.new_lock = bool(self.did_init)
+        if self.H_raw is not None:                              # smooth what the rest of the program sees
+            corners = cv2.perspectiveTransform(self.crect.reshape(-1, 1, 2), self.H_raw).reshape(-1)
+            if self.new_lock or (self.filt.x is not None and np.max(np.abs(corners - self.filt.x)) > 0.06 * L):
+                self.filt.reset()                               # a real jump (new lock / lost track): do not smear it
+            sm = self.filt(corners, now).reshape(4, 2).astype(np.float32)
+            self.H = cv2.getPerspectiveTransform(self.crect, sm)
+        self.prev_gray = gray
         self.t_track = (time.time() - t0) * 1000
         return ok
 
@@ -197,7 +327,7 @@ class SlotDecider:
 
 # ----------------------------------------------------------------------------
 class LiveEngine:
-    def __init__(self, tpl_json, tpl_png, on=0.12, off=0.05, spill=0.6, t_occupy=0.30, t_clear=0.50):
+    def __init__(self, tpl_json, tpl_png, on=0.12, off=0.05, spill=0.6, t_occupy=0.25, t_clear=0.40):
         with open(tpl_json) as f:
             self.tpl = json.load(f)
         self.cw0, self.ch0 = self.tpl["canon"]
@@ -206,7 +336,8 @@ class LiveEngine:
         if big is None:
             sys.exit(f"Missing {tpl_png}. Run: python parking_dots.py --make-template empty_sheet.jpg")
         self.ref_img = cv2.resize(big, (self.CW, self.CH), interpolation=cv2.INTER_AREA)
-        self.tracker = FastTracker(self.tpl["anchors"])
+        self.tracker = PoseTracker(self.tpl["anchors"], self._sheet_features(big), (self.cw0, self.ch0))
+        self.verify_left, self.verify_good = 0, 0
         self.on, self.off, self.spill = on, off, spill
         self.names = [z["name"] for z in self.tpl["zones"]]
         self.polys = {z["name"]: np.float32(z["poly"]) * SC for z in self.tpl["zones"]}
@@ -216,6 +347,25 @@ class LiveEngine:
         self._set_reference(self.ref_img)
         self.sharp_med, self.bad_align, self.t_diff, self.t_total = None, 0, 0.0, 0.0
         self.avg, self.prev_level, self.settle = None, None, 0
+
+    def _sheet_features(self, big):
+        """Corner features on the sheet itself (lanes, divider, arrows, line ends), away from the slots where cars park."""
+        g = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+        mask = np.zeros(g.shape, np.uint8)
+        cv2.fillPoly(mask, [np.int32(self.tpl["paper"])], 255)
+        mask = cv2.erode(mask, np.ones((7, 7), np.uint8))
+        slots = np.zeros(g.shape, np.uint8)
+        for z in self.tpl["zones"]:
+            cv2.fillPoly(slots, [np.int32(z["poly"])], 255)
+        mask[cv2.erode(slots, np.ones((31, 31), np.uint8)) > 0] = 0
+        for q in (0.03, 0.01, 0.004):
+            pts = cv2.goodFeaturesToTrack(g, maxCorners=300, qualityLevel=q, minDistance=8, mask=mask, blockSize=5)
+            if pts is not None and len(pts) >= 60:
+                break
+        pts = np.zeros((0, 1, 2), np.float32) if pts is None else pts
+        for a in self.tpl["anchors"]:                                   # the dots themselves are the best features
+            pts = np.vstack([pts, np.float32([[a]])])
+        return pts.reshape(-1, 2)
 
     def _build_masks(self):
         CW, CH = self.CW, self.CH
@@ -359,7 +509,7 @@ class LiveEngine:
     def process(self, frame, now=None):
         now = time.time() if now is None else now
         t0 = time.time()
-        ok = self.tracker.update_frame(frame, (self.cw0, self.ch0))
+        ok = self.tracker.update_frame(frame, (self.cw0, self.ch0), now)
         out = {"frame": frame, "tracking": ok, "rect": None, "mask": None, "ratios": {}, "ncc": {}, "scores": {},
                "status": {n: self.deciders[n].status for n in self.names}, "trusted": False, "holding": False,
                "align": None, "disturb": 0.0, "gain": None}
@@ -393,7 +543,18 @@ class LiveEngine:
         align_ok = align is None or align >= ALIGN_MIN_LIVE
         self.bad_align = 0 if align_ok else self.bad_align + 1
         if self.bad_align >= ALIGN_BAD_FRAMES:
-            self.tracker.H, self.tracker.lost, self.tracker.mode, self.bad_align = None, 0, "SEARCHING", 0
+            self.tracker.reset_pose()
+            self.bad_align, self.avg = 0, None
+        # a brand-new lock must prove itself: its warped view has to match the sheet's own lines for several frames
+        if self.tracker.new_lock:
+            self.verify_left, self.verify_good = VERIFY_FRAMES, 0
+        verifying = self.verify_left > 0
+        if verifying:
+            self.verify_left -= 1
+            self.verify_good += 1 if (align is None or align >= ALIGN_VERIFY) else 0
+            if self.verify_left == 0 and self.verify_good < VERIFY_NEED:     # wrong lock (rotated / shifted / other dots)
+                self.tracker.reset_pose()
+                self.avg = None
         # only a really sudden brightness change (light switched, camera exposure jumps) pauses decisions
         level = lvl_raw
         jump = self.prev_level is not None and abs(level - self.prev_level) / max(self.prev_level, 1.0) > EXPO_JUMP
@@ -403,7 +564,8 @@ class LiveEngine:
         # lighting event: many EMPTY slots look "changed" in the very same frame = glare / shadow / flicker, not cars
         empties = [n for n in self.names if self.deciders[n].state is False]
         mass = len(empties) >= 3 and sum(scores[n] > 0.5 for n in empties) >= max(3, MASS_FLIP * len(empties))
-        trusted = (ok and self.tracker.inliers >= TRUST_MIN_DOTS and align_ok and disturb < DISTURB_MAX
+        solid_pose = self.tracker.inliers >= TRUST_MIN_DOTS or self.tracker.flow_inl >= FLOW_MIN_TRUST
+        trusted = (ok and solid_pose and not verifying and align_ok and disturb < DISTURB_MAX
                    and not blurred and self.settle == 0 and not mass)
         for n in self.names:
             self.deciders[n].update(scores[n], now, trusted)
@@ -426,7 +588,7 @@ def _col(s):
     return {"EMPTY": GREEN, "OCCUPIED": RED}.get(s, UNKNOWN_COL)
 
 
-def build_dashboard(eng, out, fps, src_name, cam_status):
+def build_dashboard(eng, out, fps, src_name, cam_status, delay_ms=None, cam_fps=None):
     st = out["status"]
     lg = eng.logic(st)
     trk = eng.tracker
@@ -477,9 +639,12 @@ def build_dashboard(eng, out, fps, src_name, cam_status):
 
     d = np.full((360, 640, 3), 30, np.uint8)
     mode_col = GREEN if trk.mode in ("TRACKING", "RE-ACQUIRED") else (YELLOW if trk.mode == "HOLDING" else RED)
-    text(d, f"Sheet: {trk.mode}   dots {trk.inliers}/{len(trk.anchor)}   {fps:.0f} fps   {eng.t_total:.0f} ms (dots {trk.t_track:.0f}, slots {eng.t_diff:.0f})", (8, 20), 0.5, mode_col)
+    text(d, f"Sheet: {trk.mode}   dots {trk.inliers}/{len(trk.anchor)} + {trk.flow_inl} features   processing {eng.t_total:.0f} ms", (8, 20), 0.5, mode_col)
+    extra = "" if delay_ms is None else f"   processing delay {delay_ms:.0f} ms"
+    cam_txt = "" if cam_fps is None else f"camera {cam_fps:.0f} fps   "
+    text(d, f"{cam_txt}display {fps:.0f} fps{extra}", (8, 42), 0.45, GREY)
     if trk.mode == "SEARCHING":
-        text(d, "Show the whole sheet once so the dots can be found", (8, 42), 0.5, YELLOW)
+        text(d, "Show the WHOLE sheet once (all 12 dots) so it can lock on", (8, 56), 0.5, YELLOW)
     text(d, f"OCCUPIED = {' + '.join(str(b) for b in lg['bits'])} = {lg['occupied']}", (8, 72), 0.55)
     text(d, f"AVAILABLE = {lg['total']} - {lg['occupied']} = {lg['available']}      FULL = {lg['full']}", (8, 94), 0.55, GREEN if lg["available"] else RED)
     half = (len(eng.names) + 1) // 2
@@ -509,6 +674,79 @@ def build_dashboard(eng, out, fps, src_name, cam_status):
 
 
 # ----------------------------------------------------------------------------
+# Camera source that always gives the NEWEST frame (and tells how old it is)
+# ----------------------------------------------------------------------------
+class LiveSource:
+    """Reads on its own thread, keeps only the latest frame, asks FFmpeg for low-delay mode,
+    reconnects by itself, and never hands out the same frame twice."""
+
+    def __init__(self, source):
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "fflags;nobuffer|flags;low_delay|probesize;32|analyzeduration;0")
+        self.source, self.seq, self.frame, self.t, self.fps = source, 0, None, 0.0, 0.0
+        self.status_txt, self.running, self.image, self.cap = "CONNECTING", True, None, None
+        self.lock = threading.Lock()
+        if os.path.isfile(source) and source.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
+            self.image = cv2.imread(source)
+            if self.image is None:
+                sys.exit(f"Could not read image {source}")
+            self.status_txt = "IMAGE FILE"
+            return
+        self.is_file = os.path.isfile(source)                       # a video file is played at its own frame rate
+        self._open()
+        if not self.cap.isOpened():
+            sys.exit(f"Could not open '{source}'. Check the index/URL and that phone and laptop share Wi-Fi.")
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _open(self):
+        if self.cap is not None:
+            self.cap.release()
+        if self.source.isdigit():
+            cap = cv2.VideoCapture(int(self.source), cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+        else:
+            cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap = cap
+
+    def _loop(self):
+        n, t0, last_ok = 0, time.time(), time.time()
+        while self.running:
+            ok, fr = self.cap.read() if self.cap.isOpened() else (False, None)
+            now = time.time()
+            if ok and self.is_file:
+                time.sleep(max(0.0, 1.0 / max(self.cap.get(cv2.CAP_PROP_FPS), 1.0) - (time.time() - now)))
+            if ok:
+                with self.lock:
+                    self.frame, self.t, self.seq = fr, now, self.seq + 1
+                last_ok, n, self.status_txt = now, n + 1, "CONNECTED"
+                if now - t0 >= 1.0:
+                    self.fps, n, t0 = n / (now - t0), 0, now
+            else:
+                time.sleep(0.05)
+                if now - last_ok > 2.0:
+                    self.status_txt, last_ok = "RECONNECTING", now
+                    self._open()
+
+    def read(self, last_seq):
+        """(frame, seq, capture_time) of a frame newer than last_seq, else (None, last_seq, 0)."""
+        if self.image is not None:
+            time.sleep(0.03)
+            return self.image.copy(), last_seq + 1, time.time()
+        with self.lock:
+            if self.frame is None or self.seq == last_seq:
+                return None, last_seq, 0.0
+            return self.frame, self.seq, self.t
+
+    def status(self):
+        return self.status_txt
+
+    def close(self):
+        self.running = False
+        time.sleep(0.1)
+        if self.cap is not None:
+            self.cap.release()
+
+
+# ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Real-time, baseline-free smart parking vision")
     ap.add_argument("--source", default="0", help="webcam index, phone stream URL, or image file")
@@ -516,46 +754,50 @@ def main():
     ap.add_argument("--on", type=float, default=0.12)
     ap.add_argument("--off", type=float, default=0.05)
     ap.add_argument("--spill", type=float, default=0.6)
-    ap.add_argument("--occupy-time", type=float, default=0.30, help="seconds of evidence to flag a car")
-    ap.add_argument("--clear-time", type=float, default=0.50, help="seconds of evidence to clear a slot")
+    ap.add_argument("--occupy-time", type=float, default=0.25, help="seconds of evidence to flag a car")
+    ap.add_argument("--clear-time", type=float, default=0.40, help="seconds of evidence to clear a slot")
+    ap.add_argument("--ui-every", type=int, default=2, help="draw the dashboard every N processed frames (higher = faster)")
     ap.add_argument("--scale", type=float, default=1.0, help="dashboard window scale")
     ap.add_argument("--no-ui", action="store_true", help="no window, print the slot states (fastest)")
     a = ap.parse_args()
     if not os.path.exists(a.template):
         sys.exit("No template yet. Run:  python parking_dots.py --make-template empty_sheet.jpg")
     eng = LiveEngine(a.template, os.path.splitext(a.template)[0] + ".png", a.on, a.off, a.spill, a.occupy_time, a.clear_time)
-    src = FrameSource(a.source)
+    src = LiveSource(a.source)
     win = "Smart Parking LIVE"
     if not a.no_ui:
         cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
-    fps, tp, shot, last_print = 0.0, time.time(), 0, ""
+    fps, tp, shot, last_print, last_seq, n_done, delay = 0.0, time.time(), 0, "", 0, 0, 0.0
     while True:
-        frame = src.read()
+        frame, last_seq, tcap = src.read(last_seq)
         if frame is None:
-            if not a.no_ui and cv2.waitKey(20) & 0xFF == ord("q"):
+            if not a.no_ui and cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                 break
-            time.sleep(0.01)
+            time.sleep(0.002)
             continue
-        out = eng.process(frame)
-        now = time.time()
-        fps = 0.9 * fps + 0.1 / max(now - tp, 1e-3)
-        tp = now
+        out = eng.process(frame, tcap)
+        done = time.time()
+        delay = 0.8 * delay + 0.2 * (done - tcap) * 1000
+        fps = 0.9 * fps + 0.1 / max(done - tp, 1e-3)
+        tp = done
+        n_done += 1
         if a.no_ui:
             line = " ".join(f"{n}:{'#' if out['status'][n] == 'OCCUPIED' else ('.' if out['status'][n] == 'EMPTY' else '?')}" for n in eng.names)
             if line != last_print:
                 print(line, flush=True)
                 last_print = line
             continue
-        dash = build_dashboard(eng, out, fps, a.source, src.status())
-        if a.scale != 1.0:
-            dash = cv2.resize(dash, None, fx=a.scale, fy=a.scale)
-        cv2.imshow(win, dash)
-        k = cv2.waitKey(1) & 0xFF
-        if k in (ord("q"), 27):
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27):
             break
-        if k in (ord("s"), ord("S")):
-            shot += 1
-            cv2.imwrite(f"live_{shot}.png", dash)
+        if n_done % max(1, a.ui_every) == 0 or key in (ord("s"), ord("S")):
+            dash = build_dashboard(eng, out, fps, a.source, src.status(), delay, src.fps)
+            if a.scale != 1.0:
+                dash = cv2.resize(dash, None, fx=a.scale, fy=a.scale)
+            cv2.imshow(win, dash)
+            if key in (ord("s"), ord("S")):
+                shot += 1
+                cv2.imwrite(f"live_{shot}.png", dash)
     src.close()
     cv2.destroyAllWindows()
 

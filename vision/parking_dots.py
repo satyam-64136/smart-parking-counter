@@ -206,6 +206,64 @@ def build_template(photo_path, json_path, png_path):
     return tpl
 
 
+def build_template_from_layout(layout_path, photo_path, json_path, png_path, sheet_png=None):
+    """Template for the PRINTED sheet. The geometry (dots, slots, P boxes) is exact, read from the layout file
+    that make_printable_sheet.py wrote. With a photo of the empty sheet the photo is straightened and used as
+    the reference picture (best match to your camera); with photo "-" the printed design itself is the reference."""
+    with open(layout_path) as f:
+        lay = json.load(f)
+    pw, ph = lay["paper_mm"]
+    s = CAN_W / float(pw)
+    CH = int(round(ph * s))
+    anchors = np.float32([[x * s, y * s] for x, y in lay["dots_left"]] + [[x * s, y * s] for x, y in lay["dots_right"]])
+    src_name = "printed design"
+    if photo_path and photo_path != "-":
+        img = cv2.imread(photo_path)
+        if img is None:
+            sys.exit(f"Could not read {photo_path}")
+        trk = SheetTracker(anchors)
+        if not trk.update(detect_dots(img), img.shape, (CAN_W, CH)):
+            cv2.imwrite("template_debug.png", img)
+            sys.exit("Could not find all 12 orange dots in the photo. Use a sharp, evenly lit photo of the WHOLE empty sheet.")
+        canon = cv2.warpPerspective(img, trk.H, (CAN_W, CH), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+        src_name = os.path.basename(photo_path)
+    else:
+        sheet_png = sheet_png or layout_path.replace("_layout.json", ".png")
+        sheet = cv2.imread(sheet_png)
+        if sheet is None:
+            sys.exit(f"Could not read the sheet image {sheet_png}")
+        canon = cv2.resize(sheet, (CAN_W, CH), interpolation=cv2.INTER_AREA)
+    inset = 0.016 * CAN_W
+    zones = []
+    for z in lay["slots"]:
+        poly = np.float32(z["poly"]) * s
+        outer, inner = ((0, 3), (1, 2)) if z["name"].startswith("L") else ((1, 2), (0, 3))
+        for o, i in zip(outer, inner):                                   # pull the outer ends in a little
+            dvec = poly[i] - poly[o]
+            poly[o] += dvec / (np.linalg.norm(dvec) + 1e-6) * inset
+        box = lay["p_boxes"].get(z["name"])
+        zones.append({"name": z["name"], "poly": poly.tolist(), "p_box": None if box is None else [int(round(v * s)) for v in box]})
+    allp = np.vstack([np.float32(z["poly"]) for z in zones])
+    x0, y0, x1, y1 = allp[:, 0].min(), allp[:, 1].min(), allp[:, 0].max(), allp[:, 1].max()
+    x0, y0, x1, y1 = float(x0), float(y0), float(x1), float(y1)
+    paper = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    tpl = {"version": 1, "canon": [CAN_W, CH], "anchors": anchors.tolist(), "zones": zones, "paper": paper, "source_photo": src_name}
+    with open(json_path, "w") as f:
+        json.dump(tpl, f, indent=1)
+    cv2.imwrite(png_path, canon)
+    prev = canon.copy()
+    for z in zones:
+        cv2.polylines(prev, [np.int32(z["poly"])], True, (0, 200, 0), 2)
+        if z["p_box"]:
+            bx, by, bw, bh = z["p_box"]
+            cv2.rectangle(prev, (bx - 3, by - 3), (bx + bw + 3, by + bh + 3), (0, 0, 255), 1)
+    for p in anchors:
+        cv2.circle(prev, (int(p[0]), int(p[1])), 9, (255, 0, 0), 2)
+    cv2.imwrite("template_preview.png", prev)
+    print(f"Template saved: {json_path}, {png_path}  (reference: {src_name}; check template_preview.png)")
+    return tpl
+
+
 # ----------------------------------------------------------------------------
 # Sheet tracker: dots -> homography (canonical sheet -> camera frame)
 # ----------------------------------------------------------------------------
@@ -235,6 +293,7 @@ class SheetTracker:
         self.matched = np.zeros(len(self.anchor), bool)
         self.mode = "SEARCHING"
         self.cooldown = 0
+        self.did_init = False
 
     @staticmethod
     def _match(proj, pts, r):
@@ -368,6 +427,7 @@ class SheetTracker:
         return None if best is None else best[1]
 
     def update(self, dots, shape, can):
+        self.did_init = False
         L = float(max(shape[:2]))
         pts = dots[:, :2] if len(dots) else np.zeros((0, 2), np.float32)
         res = None
@@ -383,6 +443,7 @@ class SheetTracker:
             order = use[np.argsort(-dots[use, 4])[:18]]               # the 18 most clearly orange blobs at most
             res = self._init_global(np.ascontiguousarray(pts[order], np.float32), shape, can)
             if res is not None:
+                self.did_init = True
                 self.mode = "RE-ACQUIRED" if self.H is not None else "TRACKING"
             else:
                 self.cooldown = 3                                    # do not search every single frame
@@ -680,7 +741,8 @@ def build_dashboard(pd, out, fps, src_name, cam_status):
 # ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Orange-dot anchored smart parking vision")
-    ap.add_argument("--make-template", metavar="PHOTO", help="build the sheet template from a photo of the EMPTY sheet")
+    ap.add_argument("--make-template", metavar="PHOTO", help="build the sheet template from a photo of the EMPTY sheet (\"-\" = no photo, printed sheets only)")
+    ap.add_argument("--layout", metavar="LAYOUT.json", help="layout file written by make_printable_sheet.py (printed sheet)")
     ap.add_argument("--template", default=os.path.join(HERE, "sheet_template.json"))
     ap.add_argument("--template-image", default=None)
     ap.add_argument("--source", default="0", help="webcam index, phone stream URL, or image file")
@@ -693,7 +755,10 @@ def main():
     a = ap.parse_args()
     png = a.template_image or os.path.splitext(a.template)[0] + ".png"
     if a.make_template:
-        build_template(a.make_template, a.template, png)
+        if a.layout:
+            build_template_from_layout(a.layout, a.make_template, a.template, png)
+        else:
+            build_template(a.make_template, a.template, png)
         return
     if not os.path.exists(a.template):
         sys.exit("No template yet. Run:  python parking_dots.py --make-template empty_sheet.jpg")

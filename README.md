@@ -4,6 +4,20 @@ A ten-slot miniature parking system that uses **computer vision only** to detect
 
 > **Status:** prototyping. The vision pipeline is tested on simulated camera angles (`vision/selftest.py`); real-camera and hardware tests are still to do.
 
+## Printed sheet (recommended over the hand-drawn one)
+
+`sheet/parking_sheet_A4.pdf` (small cars, slots 58 mm wide) and `sheet/parking_sheet_A3.pdf` (1:64 cars such as Hot Wheels / Matchbox, slots 82 mm wide). Print at 100% / "Actual size" (never "fit to page"), in colour, on matte paper, then check that the printed bar measures 100 mm. Stick it flat on cardboard (tape all edges): curled paper is the main enemy of accuracy.
+
+What makes it accurate: 12 solid 10 mm orange dots (nothing else on the sheet is orange), thick black slot lines, a big bold P in every slot, and a deliberately irregular layout (slot heights 38/46/40/44/42 mm, right block 8 mm off-centre) so the detector can never lock one row off or upside down. The exact geometry is stored in `sheet/parking_sheet_A4_layout.json`.
+
+```powershell
+python vision/parking_live.py --template vision/printed_sheet_template.json --source http://PHONE_IP:8080/video
+```
+
+`vision/printed_sheet_template.json` is already built from the A4 design. Optional, for the best match to your camera, straighten a photo of your printed EMPTY sheet into a template:
+`python vision/parking_dots.py --layout sheet/parking_sheet_A4_layout.json --make-template photo.jpg --template vision/printed_sheet_template.json`
+For A3 use the A3 layout file. Other sizes: edit the numbers at the top of `sheet/make_printable_sheet.py` and run it.
+
 ## Real-time detector (use this one): `vision/parking_live.py`
 
 No baseline to capture or re-capture. For every slot it asks one question: **is the painted P still visible?** P visible = empty, P hidden = occupied. A cheap "something changed in the slot" cue backs it up, and each car counts for only one slot. The 12 orange dots are tracked in small windows, so camera movement is followed instantly.
@@ -15,6 +29,10 @@ python vision/selftest_live.py                       # simulated camera moves, n
 ```
 
 Decisions are time based (about 0.3 s to flag a car, 0.5 s to clear it; `--occupy-time`, `--clear-time`). While the phone is moving, blurred or the sheet is lost, the last answer is held and slots never turn yellow. Measured in simulation: about 18 ms per frame and a correct answer 0.2 s after start. Noise handling: aligned frames are averaged, every frame is brought to the template brightness, the P is matched after removing shading/glare, a car needs the P hidden AND a real change in the slot, decisions use the median of the last 5 scores, and frames where many empty slots change at once (glare, shadow, flicker) or fewer than 8 dots are matched are ignored (last answer held). `python vision/selftest_noise.py "mild room"` simulates curled paper, sensor noise, flicker, shadows, glare, shake and blur (names: mild room, noisy + flicker, shadows + glare, everything bad).
+
+Smooth, drift-free tracking: hundreds of sheet features (lanes, divider, arrows, line ends) are followed with optical flow and corrected by the dots every frame, then smoothed with a speed-adaptive 1-euro filter (still camera: boxes move about 0.1 px; moving camera: almost no lag). A NEW lock must match the sheet's own lines for 4 frames before any slot is decided, so a sideways or shifted wrong lock is thrown away instead of drawing boxes in the wrong place. With fewer than about 8 dots visible at start it waits instead of guessing; once locked it keeps tracking even if cars or a hand cover dots. `python vision/selftest_pose.py` tests this.
+
+Low delay: the camera is read on its own thread in FFmpeg low-delay mode, only the newest frame is processed, and the dashboard shows `processing delay` and the camera fps. Processing is about 40 ms per frame and the first answer comes about 0.6 s after the sheet is seen. If `processing delay` is small but the picture still lags, the delay is in the phone stream: in IP Webcam use 1280x720 or 640x480, quality 50-60, no audio, 5 GHz Wi-Fi (or use USB / DroidCam). `--ui-every 3` draws the dashboard less often for more speed; `--no-ui` prints the slot states only.
 
 Limits: a very small car parked in a corner of the slot that leaves the P visible is read as empty. Tape the sheet flat: a badly buckled sheet (more than about 2 mm of lateral shift) misreads every slot. In the very worst simulated room the detector waits for a good lock instead of guessing.
 
@@ -72,7 +90,8 @@ Two one-way lanes around a central divider (left lane up, right lane down), five
 ```text
 docs/        Project context files
 firmware/    NodeMCU (ESP8266) sketches: servo_test
-vision/      parking_vision.py (dashboard), webcam_test.py, selftest.py
+sheet/       printable A4 / A3 parking sheet (PDF, PNG, layout file) and its generator
+vision/      parking_live.py (real-time detector), parking_dots.py, parking_vision.py, self-tests
 ```
 
 ## Getting started
