@@ -8,7 +8,7 @@ A ten-slot miniature parking system that uses **computer vision only** to detect
 
 `sheet/parking_sheet_A4.pdf` (small cars, slots 58 mm wide) and `sheet/parking_sheet_A3.pdf` (1:64 cars such as Hot Wheels / Matchbox, slots 82 mm wide). Print at 100% / "Actual size" (never "fit to page"), in colour, on matte paper, then check that the printed bar measures 100 mm. Stick it flat on cardboard (tape all edges): curled paper is the main enemy of accuracy.
 
-What makes it accurate: 12 solid 10 mm orange dots (nothing else on the sheet is orange), thick black slot lines, a big bold P in every slot, and a deliberately irregular layout (slot heights 38/46/40/44/42 mm, right block 8 mm off-centre) so the detector can never lock one row off or upside down. The exact geometry is stored in `sheet/parking_sheet_A4_layout.json`.
+What makes it accurate: **4 ArUco corner markers** (flat, unique ids 0-3: the sheet is found instantly, in any rotation, even from a 640x480 stream or when the dots are too small to see), 12 solid 10 mm orange dots (nothing else on the sheet is orange), thick black slot lines, a big bold P in every slot, and a deliberately irregular layout (slot heights 38/46/40/44/42 mm, right block 8 mm off-centre) so the detector can never lock one row off or upside down. The exact geometry is stored in `sheet/parking_sheet_A4_layout.json`.
 
 ```powershell
 python vision/parking_live.py --template vision/printed_sheet_template.json --source http://PHONE_IP:8080/video
@@ -17,6 +17,19 @@ python vision/parking_live.py --template vision/printed_sheet_template.json --so
 `vision/printed_sheet_template.json` is already built from the A4 design. Optional, for the best match to your camera, straighten a photo of your printed EMPTY sheet into a template:
 `python vision/parking_dots.py --layout sheet/parking_sheet_A4_layout.json --make-template photo.jpg --template vision/printed_sheet_template.json`
 For A3 use the A3 layout file. Other sizes: edit the numbers at the top of `sheet/make_printable_sheet.py` and run it.
+
+## Optional: corner markers for your EXISTING hand-drawn sheet (not needed)
+
+The detector now recognises the sheet from its own drawing (divider hatching, slot lines, P letters, arrows), so stickers are NOT required. Markers only add a little extra robustness for very low-resolution streams.
+
+`sheet/marker_stickers_A4.pdf`: print at 100% on matte paper, cut out the 4 markers (ids 0-3; a 25 mm and a 35 mm set are on the page, use the size that fits your margins), and glue them flat in the 4 corners of your sheet, in the free margin outside the slots. Any id in any corner is fine, but do not move them afterwards. Then photograph the whole sheet (all 4 markers and all 12 dots visible, sharp, evenly lit) and rebuild the template from that photo:
+
+```powershell
+python vision/parking_dots.py --make-template photo_with_markers.jpg
+python vision/parking_live.py --source http://PHONE_IP:8080/video
+```
+
+The command prints `ArUco markers found in the photo: [0, 1, 2, 3]`. If it says fewer, retake the photo. With the markers the sheet is found instantly from any rotation, even when your dots are too small to detect in the stream.
 
 ## Real-time detector (use this one): `vision/parking_live.py`
 
@@ -29,6 +42,12 @@ python vision/selftest_live.py                       # simulated camera moves, n
 ```
 
 Decisions are time based (about 0.3 s to flag a car, 0.5 s to clear it; `--occupy-time`, `--clear-time`). While the phone is moving, blurred or the sheet is lost, the last answer is held and slots never turn yellow. Measured in simulation: about 18 ms per frame and a correct answer 0.2 s after start. Noise handling: aligned frames are averaged, every frame is brought to the template brightness, the P is matched after removing shading/glare, a car needs the P hidden AND a real change in the slot, decisions use the median of the last 5 scores, and frames where many empty slots change at once (glare, shadow, flicker) or fewer than 8 dots are matched are ignored (last answer held). `python vision/selftest_noise.py "mild room"` simulates curled paper, sensor noise, flicker, shadows, glare, shake and blur (names: mild room, noisy + flicker, shadows + glare, everything bad).
+
+Why markers and not traffic cones: cones are 3D, so their image position shifts with the camera angle (the sheet maths assumes flat landmarks), they can be knocked over or moved, and they hide the slots. Flat printed markers sit exactly on the sheet plane. Needs `opencv-python>=4.7` (cv2.aruco is built in).
+
+Wrong-pose protection: if the pose has had no dot / marker confirmation for about 0.7 s and the warped view stops matching the sheet's lines, the pose is thrown away and the program searches again (a flow-only track can otherwise slide onto the cloth). If tracking stays untrusted for 3 s the slots turn UNKNOWN instead of showing old answers. `python vision/selftest_sweep.py` simulates a continuous left-right sweep at 640x480, with and without detectable dots.
+
+No stickers needed: the sheet is recognised by matching its own details (ORB features of your template photo, the same idea as tracking a printed image in AR) against every few frames of the live view. This gives an absolute pose with no dots and no markers: in simulation on your real sheet photo, 640x480 frames, dots invisible, upside down / sideways / tilted: 0.3-1.0 px pose error, locked from a cold start, no wrong locks. It runs only while the dots or markers are not confirming the pose.
 
 Smooth, drift-free tracking: hundreds of sheet features (lanes, divider, arrows, line ends) are followed with optical flow and corrected by the dots every frame, then smoothed with a speed-adaptive 1-euro filter (still camera: boxes move about 0.1 px; moving camera: almost no lag). A NEW lock must match the sheet's own lines for 4 frames before any slot is decided, so a sideways or shifted wrong lock is thrown away instead of drawing boxes in the wrong place. With fewer than about 8 dots visible at start it waits instead of guessing; once locked it keeps tracking even if cars or a hand cover dots. `python vision/selftest_pose.py` tests this.
 
@@ -90,7 +109,7 @@ Two one-way lanes around a central divider (left lane up, right lane down), five
 ```text
 docs/        Project context files
 firmware/    NodeMCU (ESP8266) sketches: servo_test
-sheet/       printable A4 / A3 parking sheet (PDF, PNG, layout file) and its generator
+sheet/       printable A4 / A3 parking sheet (PDF, PNG, layout file), marker stickers for your own sheet, generators
 vision/      parking_live.py (real-time detector), parking_dots.py, parking_vision.py, self-tests
 ```
 

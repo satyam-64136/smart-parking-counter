@@ -36,7 +36,9 @@ SC = 0.5                         # working scale of the flat sheet view (0.5 = 3
 L_THR, DARK_RATIO, AB_THR = 45, 0.62, 22
 P_LO, P_HI = 0.60, 0.80          # P correlation (local-normalised): <= P_LO hidden, >= P_HI visible
 CAR_MIN_CHANGE = 0.07            # a hidden P only means 'car' if the slot ALSO changed at least this much
-ALIGN_MIN_LIVE = 0.30            # looser than parking_dots: uneven / curled paper is allowed
+ALIGN_MIN_LIVE = 0.50            # the warped view must keep matching the sheet's own lines, or the pose is dropped
+ABS_MAX_AGE = 20                 # frames a pose may live on optical flow alone, without a dot / marker correction
+STALE_S = 3.0                    # untrusted this long: stop showing old answers (slots become UNKNOWN)
 EMA_ALPHA = 0.4                  # temporal noise reduction: weight of the newest aligned frame
 SCORE_MEDIAN = 5                 # median of the last 5 scores per slot
 WARMUP_FRAMES = 5                # trusted frames before the first answer
@@ -191,20 +193,134 @@ class OneEuro:
 
 
 class PoseTracker(FastTracker):
-    def __init__(self, anchors, feat_pts, canon):
+    def __init__(self, anchors, feat_pts, canon, markers=None, nat=None):
         super().__init__(anchors)
+        self.markers = markers or {}                              # {id: 4x2 template corners}
+        self.nat = nat                                            # ORB keypoints/descriptors of the sheet itself
+        self.orb = cv2.ORB_create(800, fastThreshold=7) if nat else None
+        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+        self.nat_i, self.n_nat = 0, 0
+        self._nA = self._nB = np.zeros((0, 2), np.float32)
+        self.detector, self.detector_slow, self.n_markers, self.abs_age, self.frame_i = None, None, 0, 999, 0
+        if self.markers and hasattr(cv2, "aruco") and hasattr(cv2.aruco, "ArucoDetector"):
+            dic = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+            fast = cv2.aruco.DetectorParameters()                  # one threshold pass + size limits: about 12 ms
+            fast.adaptiveThreshWinSizeMin = fast.adaptiveThreshWinSizeMax = 15
+            fast.adaptiveThreshWinSizeStep = 1
+            fast.minMarkerPerimeterRate, fast.maxMarkerPerimeterRate = 0.06, 0.5
+            fast.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            slow = cv2.aruco.DetectorParameters()                  # thorough search, only used while looking for the sheet
+            slow.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            self.detector = cv2.aruco.ArucoDetector(dic, fast)
+            self.detector_slow = cv2.aruco.ArucoDetector(dic, slow)
         self.feat = np.float32(feat_pts).reshape(-1, 2)          # sheet features (template coordinates)
         self.canon = canon
         self.crect = np.float32([[0, 0], [canon[0], 0], [canon[0], canon[1]], [0, canon[1]]])
         self.H_raw, self.prev_gray = None, None
         self.filt = OneEuro()
         self.flow_inl, self.new_lock = 0, False
+        self._mA = self._mB = np.zeros((0, 2), np.float32)
 
     def reset_pose(self):
         self.H = self.H_raw = self.prev_gray = None
-        self.lost, self.mode, self.inliers, self.flow_inl = 0, "SEARCHING", 0, 0
+        self.lost, self.mode, self.inliers, self.flow_inl, self.abs_age = 0, "SEARCHING", 0, 0, 999
         self.matched[:] = False
         self.filt.reset()
+
+    def _natural_pairs(self, gray, L):
+        """The sheet's own drawing (divider hatching, lines, P letters, arrows) matched against the template photo:
+        an absolute pose with no dots and no stickers. Runs while searching and whenever no dot / marker confirmed the pose lately."""
+        empty = np.zeros((0, 2), np.float32)
+        if self.orb is None:
+            return empty, empty, -1
+        self.nat_i += 1
+        if not (self.H_raw is None or self.abs_age >= 4):          # dots / markers already confirm the pose: save the time
+            return empty, empty, -1
+        h, w = gray.shape
+        sc = min(1.0, 640.0 / max(h, w))
+        g = cv2.resize(gray, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA) if sc < 1.0 else gray
+        kp, des = self.orb.detectAndCompute(g, None)
+        if des is None or len(kp) < 20:
+            return empty, empty, 0
+        pairs = [m for m in self.bf.knnMatch(self.nat["des"], des, k=2) if len(m) == 2]
+        good = [a for a, b in pairs if a.distance < 0.78 * b.distance]
+        if len(good) < 15:
+            return empty, empty, 0
+        A = self.nat["kp"][[a.queryIdx for a in good]]
+        B = np.float32([kp[a.trainIdx].pt for a in good]) / sc
+        Hn, inl = cv2.findHomography(A, B, cv2.RANSAC, 3.0 / sc)
+        if Hn is None or inl is None or int(inl.sum()) < 20:
+            return empty, empty, 0
+        inl = inl.ravel().astype(bool)
+        return A[inl], B[inl], int(inl.sum())
+
+    def _marker_pairs(self, gray):
+        """Template corners <-> image corners of every ArUco marker that is visible (ids make them unambiguous).
+        Runs every 3rd frame while the pose is healthy, every frame when it needs an absolute correction."""
+        empty = (np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32), 0)
+        if self.detector is None:
+            return empty
+        self.frame_i += 1
+        if not (self.H_raw is None or self.abs_age >= 6 or self.frame_i % 3 == 0):
+            return empty[0], empty[1], -1                          # -1 = not looked this frame
+        h, w = gray.shape
+        sc = min(1.0, 1280.0 / max(h, w), 960.0 / max(h, w) if self.H_raw is not None else 1.0)
+        g = cv2.resize(gray, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA) if sc < 1.0 else gray
+        corners, ids, _ = self.detector.detectMarkers(g)
+        if (ids is None or len(ids) < 2) and self.H_raw is None:    # searching for the sheet: be thorough
+            corners, ids, _ = self.detector_slow.detectMarkers(g)
+        A, B, n = [], [], 0
+        if ids is not None:
+            for c, i in zip(corners, ids.ravel()):
+                if int(i) in self.markers:
+                    A.append(self.markers[int(i)])
+                    B.append(c.reshape(4, 2) / sc)
+                    n += 1
+        if not A:
+            return empty
+        return np.vstack(A).astype(np.float32), np.vstack(B).astype(np.float32), n
+
+    @staticmethod
+    def _weighted_h(parts):
+        """Least-squares homography over (template pts, image pts, weight) groups: markers > dots > flow features."""
+        src = np.vstack([np.repeat(a, w, axis=0) for a, b, w in parts])
+        dst = np.vstack([np.repeat(b, w, axis=0) for a, b, w in parts])
+        Hn, _ = cv2.findHomography(src, dst, 0)
+        return Hn
+
+    def _lock_from_markers(self, frame, L, can, mA, mB, n_mk):
+        """No pose yet: markers give one straight away (>= 3 markers, or 2 markers confirmed by dots)."""
+        if n_mk < 2:
+            return None
+        H0, _ = cv2.findHomography(mA, mB, 0)
+        if H0 is None or not self._sane(H0, frame.shape, can):
+            return None
+        self.H = H0
+        didx, dpts = self._dot_pairs(frame, L, 0.04 * L)
+        parts = [(mA, mB, 10)]
+        matched, ninl = np.zeros(len(self.anchor), bool), 0
+        if len(didx) >= 4:
+            A, B = self.anchor[didx], np.float32(dpts)
+            d = np.linalg.norm(cv2.perspectiveTransform(A.reshape(-1, 1, 2), H0).reshape(-1, 2) - B, axis=1)
+            ok = d < max(6.0, 0.01 * L)
+            if ok.sum() >= 4:
+                parts.append((A[ok], B[ok], 6))
+                matched[np.array(didx)[ok]] = True
+                ninl = int(ok.sum())
+        if n_mk < 3 and ninl < 4:
+            return None
+        Hn = self._weighted_h(parts)
+        if Hn is None or not self._sane(Hn, frame.shape, can):
+            return None
+        return Hn, ninl, matched
+
+    def _lock_from_natural(self, frame, can):
+        if len(self._nA) < 30:
+            return None
+        Hn, _ = cv2.findHomography(self._nA, self._nB, 0)
+        if Hn is None or not self._sane(Hn, frame.shape, can):
+            return None
+        return Hn
 
     def _flow_pose(self, gray, frame, L, can):
         h, w = gray.shape
@@ -228,21 +344,38 @@ class PoseTracker(FastTracker):
         F, Pc = F[inl], Pc[inl]
         old_proj = cv2.perspectiveTransform(self.anchor.reshape(-1, 1, 2), self.H_raw).reshape(-1, 2)
         self.H = Hn
+        absolute = False
         R = float(np.clip(0.012 * L + 2.0 * self.speed, 0.012 * L, 0.05 * L))
         didx, dpts = self._dot_pairs(frame, L, R)
         matched, ninl, rms = np.zeros(len(self.anchor), bool), 0, None
+        parts = [(F, Pc, 1)]
+        if len(self._mA):                                      # ArUco corners: the strongest absolute correction
+            dm = np.linalg.norm(cv2.perspectiveTransform(self._mA.reshape(-1, 1, 2), Hn).reshape(-1, 2) - self._mB, axis=1)
+            okm = dm < max(6.0, 0.01 * L)
+            if okm.sum() >= 4:
+                parts.append((self._mA[okm], self._mB[okm], 10))
+                absolute = True
+        if len(self._nA) >= 20:                                # the sheet's own details: absolute, many points
+            dn = np.linalg.norm(cv2.perspectiveTransform(self._nA.reshape(-1, 1, 2), Hn).reshape(-1, 2) - self._nB, axis=1)
+            okn = dn < max(5.0, 0.008 * L)
+            if okn.sum() >= 20:
+                parts.append((self._nA[okn], self._nB[okn], 2))
+                absolute = True
         if len(didx) >= 4:
             A, B = self.anchor[didx], np.float32(dpts)
             proj = cv2.perspectiveTransform(A.reshape(-1, 1, 2), Hn).reshape(-1, 2)
             d = np.linalg.norm(proj - B, axis=1)
             okd = d < max(4.0, 0.006 * L)
             if okd.sum() >= 4:
-                Aok, Bok = A[okd], B[okd]
-                Hn2, _ = cv2.findHomography(np.vstack([F, np.repeat(Aok, 6, axis=0)]), np.vstack([Pc, np.repeat(Bok, 6, axis=0)]), 0)
-                if Hn2 is not None and self._sane(Hn2, frame.shape, can):
-                    Hn = Hn2
+                parts.append((A[okd], B[okd], 6))
                 matched[np.array(didx)[okd]] = True
                 ninl, rms = int(okd.sum()), float(np.sqrt(np.mean(d[okd] ** 2)))
+                absolute = True
+        if len(parts) > 1:
+            Hn2 = self._weighted_h(parts)
+            if Hn2 is not None and self._sane(Hn2, frame.shape, can):
+                Hn = Hn2
+        self.abs_age = 0 if absolute else self.abs_age + 1
         if not self._sane(Hn, frame.shape, can):
             return None
         new_proj = cv2.perspectiveTransform(self.anchor.reshape(-1, 1, 2), Hn).reshape(-1, 2)
@@ -257,18 +390,50 @@ class PoseTracker(FastTracker):
             self.gains, self.gain_age = self._wb(frame), 0
         self.gain_age += 1
         self.new_lock = False
+        self._mA, self._mB, n_seen = self._marker_pairs(gray)
+        if n_seen >= 0:
+            self.n_markers = n_seen
+        self._nA, self._nB, n_nat = self._natural_pairs(gray, L)
+        if n_nat >= 0:
+            self.n_nat = n_nat
         ok = False
         if self.H_raw is not None and self.lost <= 10:
             res = self._flow_pose(gray, frame, L, can)
             if res is not None:
                 self.H_raw, self.inliers, self.rms, self.matched, self.flow_inl = res
                 self.lost, self.mode, ok = 0, "TRACKING", True
-        if not ok:                                              # flow lost: dots in small windows, then full search
+        if not ok and len(self._mA) >= 8:                       # flow lost (or no pose yet): ArUco markers re-lock at once
+            self.H = self.H_raw
+            res = self._lock_from_markers(frame, L, can, self._mA, self._mB, len(self._mA) // 4)
+            if res is not None:
+                was = self.H_raw
+                self.H_raw, self.inliers, self.matched = res
+                self.flow_inl, self.rms, self.lost, self.mode, ok = 0, None, 0, "TRACKING", True
+                self.abs_age = 0
+                self.new_lock = True
+        if not ok and len(self._nA) >= 30:                      # no dots, no markers needed: lock on the sheet's own drawing
+            Hn = self._lock_from_natural(frame, can)
+            if Hn is not None:
+                self.H = Hn
+                matched = np.zeros(len(self.anchor), bool)
+                didx, dpts = self._dot_pairs(frame, L, 0.02 * L)
+                self.inliers = 0
+                if len(didx) >= 4:
+                    A, B = self.anchor[didx], np.float32(dpts)
+                    d = np.linalg.norm(cv2.perspectiveTransform(A.reshape(-1, 1, 2), Hn).reshape(-1, 2) - B, axis=1)
+                    okd = d < max(5.0, 0.008 * L)
+                    matched[np.array(didx)[okd]] = True
+                    self.inliers = int(okd.sum())
+                self.matched, self.H_raw = matched, Hn
+                self.flow_inl, self.rms, self.lost, self.mode, self.abs_age, ok = 0, None, 0, "TRACKING", 0, True
+                self.new_lock = True
+        if not ok:                                              # dots in small windows, then full search
             self.H = self.H_raw
             ok = FastTracker.update_frame(self, frame, can)
             if ok:
                 self.H_raw, self.flow_inl = self.H, 0
                 self.new_lock = bool(self.did_init)
+                self.abs_age = 0 if self.did_init or self.inliers >= 4 else self.abs_age + 1
         if self.H_raw is not None:                              # smooth what the rest of the program sees
             corners = cv2.perspectiveTransform(self.crect.reshape(-1, 1, 2), self.H_raw).reshape(-1)
             if self.new_lock or (self.filt.x is not None and np.max(np.abs(corners - self.filt.x)) > 0.06 * L):
@@ -291,6 +456,9 @@ class SlotDecider:
         self.state, self.since = None, None
         self.hist = []                               # recent scores (noise reduction: median filter)
         self.n = 0
+
+    def reset(self):
+        self.state, self.since, self.hist, self.n = None, None, [], 0
 
     def smoothed(self):
         return float(np.median(self.hist[-SCORE_MEDIAN:])) if self.hist else 0.0
@@ -336,8 +504,11 @@ class LiveEngine:
         if big is None:
             sys.exit(f"Missing {tpl_png}. Run: python parking_dots.py --make-template empty_sheet.jpg")
         self.ref_img = cv2.resize(big, (self.CW, self.CH), interpolation=cv2.INTER_AREA)
-        self.tracker = PoseTracker(self.tpl["anchors"], self._sheet_features(big), (self.cw0, self.ch0))
+        markers = {int(m["id"]): np.float32(m["corners"]) for m in self.tpl.get("markers", [])}
+        self.tracker = PoseTracker(self.tpl["anchors"], self._sheet_features(big, markers), (self.cw0, self.ch0), markers, self._natural_template(big))
+        self.last_trusted = None
         self.verify_left, self.verify_good = 0, 0
+        self.cache, self.frame_n, self.skip_mode, self.avg_ms = None, 0, False, 30.0
         self.on, self.off, self.spill = on, off, spill
         self.names = [z["name"] for z in self.tpl["zones"]]
         self.polys = {z["name"]: np.float32(z["poly"]) * SC for z in self.tpl["zones"]}
@@ -348,7 +519,18 @@ class LiveEngine:
         self.sharp_med, self.bad_align, self.t_diff, self.t_total = None, 0, 0.0, 0.0
         self.avg, self.prev_level, self.settle = None, None, 0
 
-    def _sheet_features(self, big):
+    def _natural_template(self, big):
+        """ORB features of the template photo inside the sheet area: the sheet's own drawing is the landmark."""
+        g = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+        mask = np.zeros(g.shape, np.uint8)
+        cv2.fillPoly(mask, [np.int32(self.tpl["paper"])], 255)
+        mask = cv2.dilate(mask, np.ones((15, 15), np.uint8))
+        kp, des = cv2.ORB_create(1500, fastThreshold=7).detectAndCompute(g, mask)
+        if des is None or len(kp) < 100:
+            return None
+        return {"kp": np.float32([k.pt for k in kp]), "des": des}
+
+    def _sheet_features(self, big, markers=None):
         """Corner features on the sheet itself (lanes, divider, arrows, line ends), away from the slots where cars park."""
         g = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
         mask = np.zeros(g.shape, np.uint8)
@@ -365,6 +547,9 @@ class LiveEngine:
         pts = np.zeros((0, 1, 2), np.float32) if pts is None else pts
         for a in self.tpl["anchors"]:                                   # the dots themselves are the best features
             pts = np.vstack([pts, np.float32([[a]])])
+        for c4 in (markers or {}).values():                              # so are the ArUco marker corners
+            for c in c4:
+                pts = np.vstack([pts, np.float32([[c]])])
         return pts.reshape(-1, 2)
 
     def _build_masks(self):
@@ -474,22 +659,29 @@ class LiveEngine:
         return ratios
 
     def _p_scores(self, ln):
+        """Correlation of each slot's P with the template P. Small search first (fast); a slot that is
+        currently EMPTY but reads 'hidden' gets a second, wider search (curled paper / pose error) before it counts."""
         out = {}
-        pad, srch = 3, 9
-        for n in self.names:
-            box = self.pbox[n]
-            if box is None:
-                out[n] = None
-                continue
-            x, y, w, h = [int(round(v)) for v in box]
+        pad = 3
+
+        def match(n, srch):
+            x, y, w, h = [int(round(v)) for v in self.pbox[n]]
             tx0, ty0, tx1, ty1 = x - pad, y - pad, x + w + pad, y + h + pad
             sx0, sy0, sx1, sy1 = max(0, tx0 - srch), max(0, ty0 - srch), min(self.CW, tx1 + srch), min(self.CH, ty1 + srch)
             tpl = self.ref_ln[ty0:ty1, tx0:tx1]
             win = ln[sy0:sy1, sx0:sx1]
             if tpl.size == 0 or win.shape[0] < tpl.shape[0] or win.shape[1] < tpl.shape[1]:
+                return None
+            return float(cv2.matchTemplate(win, tpl, cv2.TM_CCOEFF_NORMED).max())
+
+        for n in self.names:
+            if self.pbox[n] is None:
                 out[n] = None
                 continue
-            out[n] = float(cv2.matchTemplate(win, tpl, cv2.TM_CCOEFF_NORMED).max())
+            v = match(n, 5)
+            if v is not None and v < P_LO and self.deciders[n].state is not True:
+                v = max(v, match(n, 10) or v)
+            out[n] = v
         return out
 
     def _score(self, ratio, ncc):
@@ -505,6 +697,15 @@ class LiveEngine:
         # P partly covered (0.60..0.80): a car if a real chunk of the slot also changed; a lone blur or shade is not enough
         return 0.75 * float(np.clip((ratio - 0.08) / 0.14, 0, 1))
 
+    def _stale_check(self, now, trusted):
+        """Tracking lost / untrusted for STALE_S: old answers may be wrong now, so show UNKNOWN until it re-locks."""
+        if trusted:
+            self.last_trusted = now
+        elif self.last_trusted is not None and now - self.last_trusted > STALE_S:
+            for dcd in self.deciders.values():
+                dcd.reset()
+            self.last_trusted = None
+
     # -- one frame ---------------------------------------------------------------------
     def process(self, frame, now=None):
         now = time.time() if now is None else now
@@ -515,8 +716,21 @@ class LiveEngine:
                "align": None, "disturb": 0.0, "gain": None}
         if self.tracker.H is None:
             out["holding"] = True
+            self._stale_check(now, False)
+            out["status"] = {n: self.deciders[n].status for n in self.names}
             self.t_total = (time.time() - t0) * 1000
             return out
+        # on a slow machine, analyse the slots every 2nd frame (pose tracking and the boxes still run every frame)
+        self.frame_n += 1
+        if self.skip_mode and self.cache is not None and not self.tracker.new_lock and self.frame_n % 2 == 1:
+            c = dict(self.cache)
+            trusted = bool(c["trusted"] and ok)
+            c.update(frame=frame, tracking=ok, trusted=trusted, holding=not trusted,
+                     status={n: self.deciders[n].status for n in self.names})
+            self._stale_check(now, trusted)
+            self.t_total = (time.time() - t0) * 1000
+            self._adapt()
+            return c
         Hh = self.tracker.H @ np.diag([1.0 / SC, 1.0 / SC, 1.0])
         raw = cv2.warpPerspective(frame, Hh, (self.CW, self.CH), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
         t1 = time.time()
@@ -541,10 +755,14 @@ class LiveEngine:
         self.sharp_med = sharp if self.sharp_med is None else (0.97 * self.sharp_med + 0.03 * sharp if sharp > BLUR_RATIO * self.sharp_med else self.sharp_med)
         blurred = sharp < BLUR_RATIO * self.sharp_med
         align_ok = align is None or align >= ALIGN_MIN_LIVE
-        self.bad_align = 0 if align_ok else self.bad_align + 1
+        confirmed = self.tracker.abs_age <= 3                      # dots / markers confirmed the pose a moment ago: low line match = something covers the sheet, not a wrong pose
+        self.bad_align = 0 if (align_ok or confirmed) else self.bad_align + 1
         if self.bad_align >= ALIGN_BAD_FRAMES:
             self.tracker.reset_pose()
             self.bad_align, self.avg = 0, None
+        if self.tracker.abs_age > ABS_MAX_AGE and align is not None and align < 0.7:     # drifting on flow alone: drop it
+            self.tracker.reset_pose()
+            self.avg = None
         # a brand-new lock must prove itself: its warped view has to match the sheet's own lines for several frames
         if self.tracker.new_lock:
             self.verify_left, self.verify_good = VERIFY_FRAMES, 0
@@ -564,15 +782,26 @@ class LiveEngine:
         # lighting event: many EMPTY slots look "changed" in the very same frame = glare / shadow / flicker, not cars
         empties = [n for n in self.names if self.deciders[n].state is False]
         mass = len(empties) >= 3 and sum(scores[n] > 0.5 for n in empties) >= max(3, MASS_FLIP * len(empties))
-        solid_pose = self.tracker.inliers >= TRUST_MIN_DOTS or self.tracker.flow_inl >= FLOW_MIN_TRUST
-        trusted = (ok and solid_pose and not verifying and align_ok and disturb < DISTURB_MAX
+        solid_pose = (self.tracker.inliers >= TRUST_MIN_DOTS or self.tracker.flow_inl >= FLOW_MIN_TRUST or self.tracker.n_markers >= 2 or self.tracker.n_nat >= 30)
+        confident = self.tracker.abs_age <= 2 * ABS_MAX_AGE or (align is not None and align >= 0.85)
+        trusted = (ok and solid_pose and confident and not verifying and align_ok and disturb < DISTURB_MAX
                    and not blurred and self.settle == 0 and not mass)
         for n in self.names:
             self.deciders[n].update(scores[n], now, trusted)
+        self._stale_check(now, trusted)
         out.update(rect=rect, mask=mask, ratios=ratios, ncc=ncc, scores=scores, trusted=trusted, holding=not trusted,
                    status={n: self.deciders[n].status for n in self.names}, align=align, disturb=disturb, gain=gain)
         self.t_total = (time.time() - t0) * 1000
+        self.cache = dict(out)
+        self._adapt()
         return out
+
+    def _adapt(self):
+        self.avg_ms = 0.9 * self.avg_ms + 0.1 * min(self.t_total, 100.0)       # a one-off lock-on search must not count as 'slow'
+        if self.avg_ms > 55:
+            self.skip_mode = True
+        elif self.avg_ms < 38:
+            self.skip_mode = False
 
     def logic(self, status):
         bits = [1 if status.get(n) == "OCCUPIED" else 0 for n in self.names]
@@ -639,7 +868,7 @@ def build_dashboard(eng, out, fps, src_name, cam_status, delay_ms=None, cam_fps=
 
     d = np.full((360, 640, 3), 30, np.uint8)
     mode_col = GREEN if trk.mode in ("TRACKING", "RE-ACQUIRED") else (YELLOW if trk.mode == "HOLDING" else RED)
-    text(d, f"Sheet: {trk.mode}   dots {trk.inliers}/{len(trk.anchor)} + {trk.flow_inl} features   processing {eng.t_total:.0f} ms", (8, 20), 0.5, mode_col)
+    text(d, f"Sheet: {trk.mode}  sheet-match {trk.n_nat}  dots {trk.inliers}/{len(trk.anchor)}  tracked {trk.flow_inl}  {eng.t_total:.0f} ms", (8, 20), 0.5, mode_col)
     extra = "" if delay_ms is None else f"   processing delay {delay_ms:.0f} ms"
     cam_txt = "" if cam_fps is None else f"camera {cam_fps:.0f} fps   "
     text(d, f"{cam_txt}display {fps:.0f} fps{extra}", (8, 42), 0.45, GREY)
