@@ -36,6 +36,8 @@ SC = 0.5                         # working scale of the flat sheet view (0.5 = 3
 L_THR, DARK_RATIO, AB_THR = 45, 0.62, 22
 P_LO, P_HI = 0.60, 0.80          # P correlation (local-normalised): <= P_LO hidden, >= P_HI visible
 CAR_MIN_CHANGE = 0.07            # a hidden P only means 'car' if the slot ALSO changed at least this much
+NCC_MIN, NCC_VERIFY, NCC_LOCK = 0.45, 0.60, 0.50      # structure correlation with the template: keep tracking / confirm a new lock / accept a candidate lock
+BAD_POSE_FRAMES = 8              # analysed frames of a pose that no longer looks like the sheet = drop it, whatever the dots say
 ALIGN_MIN_LIVE = 0.50            # the warped view must keep matching the sheet's own lines, or the pose is dropped
 ABS_MAX_AGE = 20                 # frames a pose may live on optical flow alone, without a dot / marker correction
 STALE_S = 3.0                    # untrusted this long: stop showing old answers (slots become UNKNOWN)
@@ -310,15 +312,20 @@ class PoseTracker(FastTracker):
         if n_mk < 3 and ninl < 4:
             return None
         Hn = self._weighted_h(parts)
-        if Hn is None or not self._sane(Hn, frame.shape, can):
+        if Hn is None or not self._sane(Hn, frame.shape, can) or not self._appearance_ok(frame, Hn):
             return None
         return Hn, ninl, matched
+
+    def _appearance_ok(self, frame, H):
+        if self.pose_scorer is None:
+            return True
+        return self.pose_scorer(frame, H)[1] >= NCC_LOCK
 
     def _lock_from_natural(self, frame, can):
         if len(self._nA) < 30:
             return None
         Hn, _ = cv2.findHomography(self._nA, self._nB, 0)
-        if Hn is None or not self._sane(Hn, frame.shape, can):
+        if Hn is None or not self._sane(Hn, frame.shape, can) or not self._appearance_ok(frame, Hn):
             return None
         return Hn
 
@@ -386,6 +393,7 @@ class PoseTracker(FastTracker):
         t0 = time.time()
         L = float(max(frame.shape[:2]))
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.frame_for_score = frame
         if self.gain_age >= 20:
             self.gains, self.gain_age = self._wb(frame), 0
         self.gain_age += 1
@@ -507,6 +515,8 @@ class LiveEngine:
         markers = {int(m["id"]): np.float32(m["corners"]) for m in self.tpl.get("markers", [])}
         self.tracker = PoseTracker(self.tpl["anchors"], self._sheet_features(big, markers), (self.cw0, self.ch0), markers, self._natural_template(big))
         self.last_trusted = None
+        self.tracker.pose_scorer = self.pose_stats
+        self.bad_pose = 0
         self.verify_left, self.verify_good = 0, 0
         self.cache, self.frame_n, self.skip_mode, self.avg_ms = None, 0, False, 30.0
         self.on, self.off, self.spill = on, off, spill
@@ -697,6 +707,20 @@ class LiveEngine:
         # P partly covered (0.60..0.80): a car if a real chunk of the slot also changed; a lone blur or shade is not enough
         return 0.75 * float(np.clip((ratio - 0.08) / 0.14, 0, 1))
 
+    def pose_stats(self, frame, H):
+        """How much does the live view, warped with pose H, look like THIS sheet?  Returns
+        (line match = share of the sheet's fixed lines found where they belong, structure correlation of lanes + divider)."""
+        Hh = H @ np.diag([1.0 / SC, 1.0 / SC, 1.0])
+        rect = cv2.warpPerspective(frame, Hh, (self.CW, self.CH), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+        blur = cv2.GaussianBlur(cv2.cvtColor(rect, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+        edges = cv2.Canny(blur, 60, 140)
+        n_ref = int(np.count_nonzero(self.ref_probe_edges))
+        align = None if n_ref < 80 else float(np.count_nonzero(self.ref_probe_edges & (cv2.dilate(edges, np.ones((7, 7), np.uint8)) > 0)) / n_ref)
+        a = self._local_norm(blur)[self.probe]
+        b = self.ref_ln[self.probe]
+        ncc = float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-6))
+        return align, ncc
+
     def _stale_check(self, now, trusted):
         """Tracking lost / untrusted for STALE_S: old answers may be wrong now, so show UNKNOWN until it re-locks."""
         if trusted:
@@ -713,7 +737,7 @@ class LiveEngine:
         ok = self.tracker.update_frame(frame, (self.cw0, self.ch0), now)
         out = {"frame": frame, "tracking": ok, "rect": None, "mask": None, "ratios": {}, "ncc": {}, "scores": {},
                "status": {n: self.deciders[n].status for n in self.names}, "trusted": False, "holding": False,
-               "align": None, "disturb": 0.0, "gain": None}
+               "align": None, "disturb": 0.0, "gain": None, "lane_ncc": None, "pose_ok": False}
         if self.tracker.H is None:
             out["holding"] = True
             self._stale_check(now, False)
@@ -731,7 +755,9 @@ class LiveEngine:
             self.t_total = (time.time() - t0) * 1000
             self._adapt()
             return c
-        Hh = self.tracker.H @ np.diag([1.0 / SC, 1.0 / SC, 1.0])
+        # analyse with the latest, un-smoothed pose (the smoothed one lags while the phone moves); the smoothed pose is for drawing
+        H_an = self.tracker.H_raw if self.tracker.H_raw is not None else self.tracker.H
+        Hh = H_an @ np.diag([1.0 / SC, 1.0 / SC, 1.0])
         raw = cv2.warpPerspective(frame, Hh, (self.CW, self.CH), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
         t1 = time.time()
         # exposure flicker / auto-exposure: bring every aligned frame to the template brightness first,
@@ -749,27 +775,29 @@ class LiveEngine:
         mask, gray, gain, align, disturb = self._diff(rect)
         solid = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))      # thin lines / speckle vanish, cars stay
         ratios = self._assign(solid)
-        ncc = self._p_scores(self._local_norm(cv2.GaussianBlur(gray, (3, 3), 0)))
+        ln = self._local_norm(cv2.GaussianBlur(gray, (3, 3), 0))
+        ncc = self._p_scores(ln)
+        a_l, b_l = ln[self.probe], self.ref_ln[self.probe]
+        lane_ncc = float((a_l * b_l).sum() / (np.sqrt((a_l * a_l).sum() * (b_l * b_l).sum()) + 1e-6))
         self.t_diff = (time.time() - t1) * 1000
         sharp = float(cv2.Laplacian(gray, cv2.CV_32F).var())
         self.sharp_med = sharp if self.sharp_med is None else (0.97 * self.sharp_med + 0.03 * sharp if sharp > BLUR_RATIO * self.sharp_med else self.sharp_med)
         blurred = sharp < BLUR_RATIO * self.sharp_med
+        # Does the warped view still look like THIS sheet?  This decides everything, whatever the dots / markers say:
+        # a pose that does not match the sheet's own drawing is dropped (wrong lock, sheet removed, camera moved away).
         align_ok = align is None or align >= ALIGN_MIN_LIVE
-        confirmed = self.tracker.abs_age <= 3                      # dots / markers confirmed the pose a moment ago: low line match = something covers the sheet, not a wrong pose
-        self.bad_align = 0 if (align_ok or confirmed) else self.bad_align + 1
-        if self.bad_align >= ALIGN_BAD_FRAMES:
+        look_ok = align_ok and lane_ncc >= NCC_MIN
+        self.bad_pose = 0 if look_ok else self.bad_pose + 1
+        if self.bad_pose >= BAD_POSE_FRAMES:
             self.tracker.reset_pose()
-            self.bad_align, self.avg = 0, None
-        if self.tracker.abs_age > ABS_MAX_AGE and align is not None and align < 0.7:     # drifting on flow alone: drop it
-            self.tracker.reset_pose()
-            self.avg = None
-        # a brand-new lock must prove itself: its warped view has to match the sheet's own lines for several frames
+            self.bad_pose, self.avg, self.verify_left = 0, None, 0
+        # a brand-new lock must prove itself over several frames before anything is shown or decided
         if self.tracker.new_lock:
             self.verify_left, self.verify_good = VERIFY_FRAMES, 0
         verifying = self.verify_left > 0
         if verifying:
             self.verify_left -= 1
-            self.verify_good += 1 if (align is None or align >= ALIGN_VERIFY) else 0
+            self.verify_good += 1 if ((align is None or align >= ALIGN_VERIFY) and lane_ncc >= NCC_VERIFY) else 0
             if self.verify_left == 0 and self.verify_good < VERIFY_NEED:     # wrong lock (rotated / shifted / other dots)
                 self.tracker.reset_pose()
                 self.avg = None
@@ -784,13 +812,15 @@ class LiveEngine:
         mass = len(empties) >= 3 and sum(scores[n] > 0.5 for n in empties) >= max(3, MASS_FLIP * len(empties))
         solid_pose = (self.tracker.inliers >= TRUST_MIN_DOTS or self.tracker.flow_inl >= FLOW_MIN_TRUST or self.tracker.n_markers >= 2 or self.tracker.n_nat >= 30)
         confident = self.tracker.abs_age <= 2 * ABS_MAX_AGE or (align is not None and align >= 0.85)
-        trusted = (ok and solid_pose and confident and not verifying and align_ok and disturb < DISTURB_MAX
+        trusted = (ok and solid_pose and confident and not verifying and look_ok and disturb < DISTURB_MAX
                    and not blurred and self.settle == 0 and not mass)
+        pose_ok = (not verifying) and self.bad_pose < 3 and self.tracker.H is not None
         for n in self.names:
             self.deciders[n].update(scores[n], now, trusted)
         self._stale_check(now, trusted)
         out.update(rect=rect, mask=mask, ratios=ratios, ncc=ncc, scores=scores, trusted=trusted, holding=not trusted,
-                   status={n: self.deciders[n].status for n in self.names}, align=align, disturb=disturb, gain=gain)
+                   status={n: self.deciders[n].status for n in self.names}, align=align, disturb=disturb, gain=gain,
+                   lane_ncc=lane_ncc, pose_ok=pose_ok)
         self.t_total = (time.time() - t0) * 1000
         self.cache = dict(out)
         self._adapt()
@@ -822,7 +852,8 @@ def build_dashboard(eng, out, fps, src_name, cam_status, delay_ms=None, cam_fps=
     lg = eng.logic(st)
     trk = eng.tracker
     cam = out["frame"].copy()
-    if trk.H is not None:
+    pose_ok = bool(out.get("pose_ok"))
+    if trk.H is not None and pose_ok:
         proj = cv2.perspectiveTransform(trk.anchor.reshape(-1, 1, 2), trk.H).reshape(-1, 2)
         for i, p in enumerate(proj):
             cv2.drawMarker(cam, (int(p[0]), int(p[1])), GREEN if trk.matched[i] else RED, cv2.MARKER_CROSS, 16, 2)
@@ -838,12 +869,14 @@ def build_dashboard(eng, out, fps, src_name, cam_status, delay_ms=None, cam_fps=
             cv2.polylines(cam, [q], True, _col(st[n]), 2, cv2.LINE_AA)
             c = q.mean(axis=0).astype(int)
             text(cam, n, (c[0] - 12, c[1] + 5), 0.55, WHITE, 2)
-    if out["holding"]:
-        text(cam, "HOLDING last answer (moving / blurred / searching)", (10, 28), 0.7, YELLOW, 2)
+    if not pose_ok:
+        text(cam, "SEARCHING for the sheet ... (point the camera at it)", (10, 28), 0.7, YELLOW, 2)
+    elif out["holding"]:
+        text(cam, "HOLDING last answer (moving / blurred)", (10, 28), 0.7, YELLOW, 2)
     text(cam, f"camera: {cam_status}", (8, cam.shape[0] - 10), 0.8, GREEN if cam_status in ("CONNECTED", "IMAGE FILE") else RED, 2)
     pA = fit(cam, 640, 360, "1) CAMERA - dots matched (green +), missing (red +)")
 
-    if out["rect"] is not None:
+    if out["rect"] is not None and pose_ok:
         rb = cv2.resize(out["rect"], (320, int(320 * eng.CH / eng.CW)))
         sc = 320.0 / eng.CW
         over = rb.copy()
@@ -859,7 +892,7 @@ def build_dashboard(eng, out, fps, src_name, cam_status, delay_ms=None, cam_fps=
     else:
         rb = None
     pB = fit(rb, 320, 427, "2) FLAT SHEET  (box = the P being looked for)")
-    if out["mask"] is not None:
+    if out["mask"] is not None and pose_ok:
         heat = cv2.cvtColor(out["mask"], cv2.COLOR_GRAY2BGR)
         heat[out["mask"] > 0] = (60, 90, 255)
         pC = fit(cv2.resize(heat, (320, int(320 * eng.CH / eng.CW))), 320, 427, "3) EXTRA CUE: what changed")
@@ -872,8 +905,11 @@ def build_dashboard(eng, out, fps, src_name, cam_status, delay_ms=None, cam_fps=
     extra = "" if delay_ms is None else f"   processing delay {delay_ms:.0f} ms"
     cam_txt = "" if cam_fps is None else f"camera {cam_fps:.0f} fps   "
     text(d, f"{cam_txt}display {fps:.0f} fps{extra}", (8, 42), 0.45, GREY)
-    if trk.mode == "SEARCHING":
-        text(d, "Show the WHOLE sheet once (all 12 dots) so it can lock on", (8, 56), 0.5, YELLOW)
+    ln_ = out.get("lane_ncc")
+    if not pose_ok:
+        text(d, "Searching for the sheet - show it clearly, whole, and hold still a moment", (8, 56), 0.5, YELLOW)
+    elif ln_ is not None:
+        text(d, f"sheet match {ln_:.2f}   (drops the pose below {NCC_MIN:.2f}; confirms a new lock at {NCC_VERIFY:.2f})", (8, 56), 0.45, GREEN if ln_ >= NCC_VERIFY else YELLOW)
     text(d, f"OCCUPIED = {' + '.join(str(b) for b in lg['bits'])} = {lg['occupied']}", (8, 72), 0.55)
     text(d, f"AVAILABLE = {lg['total']} - {lg['occupied']} = {lg['available']}      FULL = {lg['full']}", (8, 94), 0.55, GREEN if lg["available"] else RED)
     half = (len(eng.names) + 1) // 2
@@ -986,11 +1022,15 @@ def main():
     ap.add_argument("--occupy-time", type=float, default=0.25, help="seconds of evidence to flag a car")
     ap.add_argument("--clear-time", type=float, default=0.40, help="seconds of evidence to clear a slot")
     ap.add_argument("--ui-every", type=int, default=2, help="draw the dashboard every N processed frames (higher = faster)")
+    ap.add_argument("--match-min", type=float, default=NCC_MIN, help="sheet match below this drops the pose (lower it if it never locks although the sheet is clearly visible)")
+    ap.add_argument("--match-verify", type=float, default=NCC_VERIFY, help="sheet match needed to confirm a new lock")
     ap.add_argument("--scale", type=float, default=1.0, help="dashboard window scale")
     ap.add_argument("--no-ui", action="store_true", help="no window, print the slot states (fastest)")
     a = ap.parse_args()
     if not os.path.exists(a.template):
         sys.exit("No template yet. Run:  python parking_dots.py --make-template empty_sheet.jpg")
+    globals()["NCC_MIN"], globals()["NCC_VERIFY"] = a.match_min, a.match_verify
+    globals()["NCC_LOCK"] = min(NCC_LOCK, a.match_verify)
     eng = LiveEngine(a.template, os.path.splitext(a.template)[0] + ".png", a.on, a.off, a.spill, a.occupy_time, a.clear_time)
     src = LiveSource(a.source)
     win = "Smart Parking LIVE"

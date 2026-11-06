@@ -189,8 +189,20 @@ def build_template(photo_path, json_path, png_path):
     anchors = np.vstack([rows["L"], rows["R"]]) * s
     allpts = np.vstack([relaxed[:, :2] * s])
     paper = cv2.convexHull(allpts.astype(np.float32)).reshape(-1, 2)
+    markers = []                                   # ArUco corner stickers stuck on this sheet (see make_marker_stickers.py)
+    if hasattr(cv2, "aruco") and hasattr(cv2.aruco, "ArucoDetector"):
+        det = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50), cv2.aruco.DetectorParameters())
+        mc, mi, _ = det.detectMarkers(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+        seen = set()
+        for c, i in zip(mc, [] if mi is None else mi.ravel()):
+            if 0 <= int(i) <= 3 and int(i) not in seen:
+                seen.add(int(i))
+                markers.append({"id": int(i), "corners": (c.reshape(4, 2) * s).tolist()})
+    ids_found = sorted(m["id"] for m in markers)
+    print(f"ArUco markers found in the photo: {ids_found if ids_found else 'none'}"
+          + ("" if len(ids_found) >= 3 else "  (stick the 4 corner markers on the sheet and retake the photo for much more robust tracking)"))
     tpl = {"version": 1, "canon": [CAN_W, CH], "anchors": anchors.tolist(),
-           "zones": zones, "paper": paper.tolist(), "source_photo": os.path.basename(photo_path)}
+           "zones": zones, "paper": paper.tolist(), "markers": markers, "source_photo": os.path.basename(photo_path)}
     with open(json_path, "w") as f:
         json.dump(tpl, f, indent=1)
     cv2.imwrite(png_path, canon)
@@ -247,7 +259,9 @@ def build_template_from_layout(layout_path, photo_path, json_path, png_path, she
     x0, y0, x1, y1 = allp[:, 0].min(), allp[:, 1].min(), allp[:, 0].max(), allp[:, 1].max()
     x0, y0, x1, y1 = float(x0), float(y0), float(x1), float(y1)
     paper = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
-    tpl = {"version": 1, "canon": [CAN_W, CH], "anchors": anchors.tolist(), "zones": zones, "paper": paper, "source_photo": src_name}
+    markers = [{"id": int(m["id"]), "corners": (np.float32(m["corners"]) * s).tolist()} for m in lay.get("markers", [])]
+    tpl = {"version": 1, "canon": [CAN_W, CH], "anchors": anchors.tolist(), "zones": zones, "paper": paper,
+           "markers": markers, "source_photo": src_name}
     with open(json_path, "w") as f:
         json.dump(tpl, f, indent=1)
     cv2.imwrite(png_path, canon)
@@ -294,6 +308,8 @@ class SheetTracker:
         self.mode = "SEARCHING"
         self.cooldown = 0
         self.did_init = False
+        self.pose_scorer = None                        # set by the engine: (frame, H) -> (line match, structure correlation)
+        self.frame_for_score = None
 
     @staticmethod
     def _match(proj, pts, r):
@@ -412,7 +428,7 @@ class SheetTracker:
                     if uniq >= 7:
                         cands.append((uniq, -float(mean_d[m]), Hs[m]))
         cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
-        best = None
+        accepted = []
         for score, _, H0 in cands[:16]:
             res = self._refine(H0, pts, (0.04 * L, 0.02 * L, 0.01 * L), L)
             if res is None:
@@ -421,10 +437,22 @@ class SheetTracker:
             tight = inl >= MIN_INLIERS_INIT and rms <= 0.0013 * L                  # few dots: must fit very exactly
             loose = inl >= 10 and rms <= 0.004 * L                                 # many dots: uneven paper may fit less exactly
             if (tight or loose) and self._sane(H, shape, can):
-                key = (inl, -rms)
-                if best is None or key > best[0]:
-                    best = (key, res)
-        return None if best is None else best[1]
+                accepted.append(((inl, -rms), res))
+        if not accepted:
+            return None
+        accepted.sort(key=lambda a: a[0], reverse=True)
+        scorer = getattr(self, "pose_scorer", None)
+        frame = getattr(self, "frame_for_score", None)
+        if scorer is not None and frame is not None:
+            # dots alone can be fooled (a periodic layout fits shifted by a row, a turned sheet, cloth patterns):
+            # judge every candidate by how much the warped picture looks like THIS sheet
+            best, best_ncc = None, 0.5
+            for _, res in accepted[:8]:
+                _, ncc = scorer(frame, res[0])
+                if ncc > best_ncc:
+                    best, best_ncc = res, ncc
+            return best
+        return accepted[0][1]
 
     def update(self, dots, shape, can):
         self.did_init = False
@@ -446,7 +474,7 @@ class SheetTracker:
                 self.did_init = True
                 self.mode = "RE-ACQUIRED" if self.H is not None else "TRACKING"
             else:
-                self.cooldown = 3                                    # do not search every single frame
+                self.cooldown = 6                                    # do not search every single frame
         self.cooldown -= 1
         if res is None:
             self.lost += 1
