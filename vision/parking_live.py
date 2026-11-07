@@ -828,9 +828,9 @@ class LiveEngine:
 
     def _adapt(self):
         self.avg_ms = 0.9 * self.avg_ms + 0.1 * min(self.t_total, 100.0)       # a one-off lock-on search must not count as 'slow'
-        if self.avg_ms > 55:
+        if self.avg_ms > 45:
             self.skip_mode = True
-        elif self.avg_ms < 38:
+        elif self.avg_ms < 30:
             self.skip_mode = False
 
     def logic(self, status):
@@ -847,19 +847,40 @@ def _col(s):
     return {"EMPTY": GREEN, "OCCUPIED": RED}.get(s, UNKNOWN_COL)
 
 
-def build_dashboard(eng, out, fps, src_name, cam_status, delay_ms=None, cam_fps=None):
+_PIPE = {"img": None}
+
+
+def _pipeline_base():
+    if _PIPE["img"] is None:
+        e = np.full((293, 640, 3), 38, np.uint8)
+        lines = [("PIPELINE", YELLOW),
+                 ("1 Find the sheet: its own drawing + dots, tracked frame to frame", WHITE),
+                 ("2 Every frame: does the view still look like YOUR sheet? (sheet match)", WHITE),
+                 ("3 Per slot: is the P visible? (correlation with the template P)", WHITE),
+                 ("4 Backup cue: big change in the slot, each car -> one slot", WHITE),
+                 ("5 Time-based decision: about 0.25 s to flag a car, 0.4 s to clear", WHITE),
+                 ("6 Moving / blurred -> HOLD last answer; sheet lost 3 s -> UNKNOWN", WHITE)]
+        for i, (txt, c) in enumerate(lines):
+            text(e, txt, (8, 24 + i * 30), 0.5 if i else 0.6, c)
+        _PIPE["img"] = e
+    return _PIPE["img"]
+
+
+def build_dashboard(eng, out, fps, src_name, cam_status, delay_ms=None, cam_fps=None, proc_fps=None):
     st = out["status"]
     lg = eng.logic(st)
     trk = eng.tracker
     cam = out["frame"].copy()
     pose_ok = bool(out.get("pose_ok"))
-    if trk.H is not None and pose_ok:
-        proj = cv2.perspectiveTransform(trk.anchor.reshape(-1, 1, 2), trk.H).reshape(-1, 2)
+    H_now = None if trk.H is None else trk.H.copy()               # the worker thread keeps updating the tracker
+    matched_now = trk.matched.copy()
+    if H_now is not None and pose_ok:
+        proj = cv2.perspectiveTransform(trk.anchor.reshape(-1, 1, 2), H_now).reshape(-1, 2)
         for i, p in enumerate(proj):
-            cv2.drawMarker(cam, (int(p[0]), int(p[1])), GREEN if trk.matched[i] else RED, cv2.MARKER_CROSS, 16, 2)
+            cv2.drawMarker(cam, (int(p[0]), int(p[1])), GREEN if matched_now[i] else RED, cv2.MARKER_CROSS, 16, 2)
         over = cam.copy()
         polys = {}
-        Hf = trk.H @ np.diag([1.0 / SC, 1.0 / SC, 1.0])
+        Hf = H_now @ np.diag([1.0 / SC, 1.0 / SC, 1.0])
         for n, poly in eng.polys.items():
             q = cv2.perspectiveTransform(poly.reshape(-1, 1, 2), Hf).reshape(-1, 2).astype(np.int32)
             polys[n] = q
@@ -904,7 +925,8 @@ def build_dashboard(eng, out, fps, src_name, cam_status, delay_ms=None, cam_fps=
     text(d, f"Sheet: {trk.mode}  sheet-match {trk.n_nat}  dots {trk.inliers}/{len(trk.anchor)}  tracked {trk.flow_inl}  {eng.t_total:.0f} ms", (8, 20), 0.5, mode_col)
     extra = "" if delay_ms is None else f"   processing delay {delay_ms:.0f} ms"
     cam_txt = "" if cam_fps is None else f"camera {cam_fps:.0f} fps   "
-    text(d, f"{cam_txt}display {fps:.0f} fps{extra}", (8, 42), 0.45, GREY)
+    proc_txt = "" if proc_fps is None else f"processing {proc_fps:.0f} fps   "
+    text(d, f"{cam_txt}{proc_txt}display {fps:.0f} fps{extra}", (8, 42), 0.45, GREY)
     ln_ = out.get("lane_ncc")
     if not pose_ok:
         text(d, "Searching for the sheet - show it clearly, whole, and hold still a moment", (8, 56), 0.5, YELLOW)
@@ -924,17 +946,10 @@ def build_dashboard(eng, out, fps, src_name, cam_status, delay_ms=None, cam_fps=
         text(d, f"{pv} ({0 if ncc is None else ncc:.2f})   change {out['ratios'].get(n, 0) * 100:.0f}%", (x0 + 34, y + 30), 0.42, GREY)
     text(d, "S screenshot   Q quit   (no baseline needed)", (8, 350), 0.42, GREY)
 
-    e = np.full((293, 640, 3), 38, np.uint8)
-    lines = [("PIPELINE", YELLOW),
-             ("1 Track the 12 orange dots in small windows (fast path)", WHITE),
-             ("2 Warp the sheet flat at half resolution", WHITE),
-             ("3 Per slot: is the P visible? (correlation with the template P)", WHITE),
-             ("4 Backup cue: big change in the slot, each car -> one slot", WHITE),
-             ("5 Time-based decision: 0.3 s to flag a car, 0.5 s to clear", WHITE),
-             ("6 Moving / blurred / sheet lost -> HOLD last answer", WHITE),
-             (f"line match {'-' if out['align'] is None else format(out['align'], '.0%')}   lane disturbance {out['disturb']:.1%}   trusted: {'yes' if out['trusted'] else 'no'}", GREY)]
-    for i, (s, c) in enumerate(lines):
-        text(e, s, (8, 24 + i * 30), 0.5 if i else 0.6, c)
+    e = _pipeline_base().copy()                                   # the static explanation is drawn once, only the last line changes
+    last = (f"line match {'-' if out['align'] is None else format(out['align'], '.0%')}   lane disturbance {out['disturb']:.1%}"
+            f"   trusted: {'yes' if out['trusted'] else 'no'}")
+    text(e, last, (8, 24 + 7 * 30), 0.5, GREY)
     return np.hstack([np.vstack([pA, d]), np.vstack([np.hstack([pB, pC]), fit(e, 640, 293)])])
 
 
@@ -1021,7 +1036,6 @@ def main():
     ap.add_argument("--spill", type=float, default=0.6)
     ap.add_argument("--occupy-time", type=float, default=0.25, help="seconds of evidence to flag a car")
     ap.add_argument("--clear-time", type=float, default=0.40, help="seconds of evidence to clear a slot")
-    ap.add_argument("--ui-every", type=int, default=2, help="draw the dashboard every N processed frames (higher = faster)")
     ap.add_argument("--match-min", type=float, default=NCC_MIN, help="sheet match below this drops the pose (lower it if it never locks although the sheet is clearly visible)")
     ap.add_argument("--match-verify", type=float, default=NCC_VERIFY, help="sheet match needed to confirm a new lock")
     ap.add_argument("--scale", type=float, default=1.0, help="dashboard window scale")
@@ -1036,37 +1050,75 @@ def main():
     win = "Smart Parking LIVE"
     if not a.no_ui:
         cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
-    fps, tp, shot, last_print, last_seq, n_done, delay = 0.0, time.time(), 0, "", 0, 0, 0.0
-    while True:
-        frame, last_seq, tcap = src.read(last_seq)
-        if frame is None:
-            if not a.no_ui and cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+
+    # Processing runs on its own thread at full speed; drawing the dashboard (about 20 ms) happens here,
+    # off the critical path, so the camera-to-answer delay and the processing rate no longer wait for the picture.
+    state = {"out": None, "seq": 0, "fps": 0.0, "delay": 0.0, "stop": False, "error": None}
+    lock = threading.Lock()
+
+    def worker():
+        last_seq, tp, t_last = 0, time.time(), time.time()
+        try:
+            while not state["stop"]:
+                frame, last_seq, tcap = src.read(last_seq)
+                if frame is None:
+                    time.sleep(0.002)
+                    if time.time() - t_last > STALE_S and state["out"] is not None and not state["out"].get("stale"):
+                        eng._stale_check(time.time(), False)                  # camera silent for 3 s: old answers may be wrong now
+                        eng.tracker.reset_pose()
+                        with lock:
+                            o = dict(state["out"])
+                            o.update(status={n: "UNKNOWN" for n in eng.names}, pose_ok=False, trusted=False, stale=True)
+                            state["out"], state["seq"] = o, state["seq"] + 1
+                    continue
+                t_last = time.time()
+                out = eng.process(frame, tcap)
+                done = time.time()
+                with lock:
+                    state["out"], state["seq"] = out, state["seq"] + 1
+                    state["delay"] = 0.8 * state["delay"] + 0.2 * (done - tcap) * 1000
+                    state["fps"] = 0.9 * state["fps"] + 0.1 / max(done - tp, 1e-3)
+                tp = done
+        except Exception as ex:                                      # show the problem instead of freezing silently
+            state["error"] = ex
+            state["stop"] = True
+
+    threading.Thread(target=worker, daemon=True).start()
+    shown, shot, last_print, t_draw, disp_fps = 0, 0, "", 0.0, 0.0
+    min_gap = 1.0 / 30.0                                              # draw the dashboard at most 30 times a second
+    while not state["stop"]:
+        with lock:
+            out, seq, fps, delay = state["out"], state["seq"], state["fps"], state["delay"]
+        if out is None or seq == shown:
+            if not a.no_ui and cv2.waitKey(2) & 0xFF in (ord("q"), 27):
                 break
-            time.sleep(0.002)
+            time.sleep(0.003)
             continue
-        out = eng.process(frame, tcap)
-        done = time.time()
-        delay = 0.8 * delay + 0.2 * (done - tcap) * 1000
-        fps = 0.9 * fps + 0.1 / max(done - tp, 1e-3)
-        tp = done
-        n_done += 1
+        shown = seq
         if a.no_ui:
             line = " ".join(f"{n}:{'#' if out['status'][n] == 'OCCUPIED' else ('.' if out['status'][n] == 'EMPTY' else '?')}" for n in eng.names)
             if line != last_print:
                 print(line, flush=True)
                 last_print = line
+            time.sleep(0.01)
             continue
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), 27):
             break
-        if n_done % max(1, a.ui_every) == 0 or key in (ord("s"), ord("S")):
-            dash = build_dashboard(eng, out, fps, a.source, src.status(), delay, src.fps)
+        now = time.time()
+        if now - t_draw >= min_gap or key in (ord("s"), ord("S")):
+            disp_fps = 0.9 * disp_fps + 0.1 / max(now - t_draw, 1e-3)
+            t_draw = now
+            dash = build_dashboard(eng, out, disp_fps, a.source, src.status(), delay, src.fps, proc_fps=fps)
             if a.scale != 1.0:
                 dash = cv2.resize(dash, None, fx=a.scale, fy=a.scale)
             cv2.imshow(win, dash)
             if key in (ord("s"), ord("S")):
                 shot += 1
                 cv2.imwrite(f"live_{shot}.png", dash)
+    state["stop"] = True
+    if state["error"] is not None:
+        print("Processing stopped:", repr(state["error"]))
     src.close()
     cv2.destroyAllWindows()
 
